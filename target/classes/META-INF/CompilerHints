@@ -6,5 +6,6 @@ dontinline,*.*_thrpt_jmhStub
 inline,ipv6parse/Ipv6Benchmark.scalar
 inline,ipv6parse/Ipv6Benchmark.setup
 inline,ipv6parse/Ipv6Benchmark.swar
+inline,ipv6parse/Ipv6Benchmark.swarOpt
 inline,ipv6parse/Ipv6Benchmark.vector
 inline,ipv6parse/Ipv6Benchmark.vectorCE

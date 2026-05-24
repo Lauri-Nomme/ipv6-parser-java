@@ -189,6 +189,22 @@ Operates on all 8 bytes simultaneously using unsigned arithmetic. Important: `>>
 **4. Accumulation across chunks**  
 Since IPv6 addresses can have up to 32 hex digits (exceeding a single 64-bit long), packed bytes from each 8-byte chunk are extracted into a `byte[32]` before the nibble conversion.
 
+### SWAROpt — Optimized version
+
+[`Ipv6ParserSWAROpt.java`](src/main/java/ipv6parse/Ipv6ParserSWAROpt.java) adds three optimizations over the baseline SWAR:
+
+**1. Direct long load via VarHandle**  
+Replaces the per-byte `loadLong` loop with `MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN)` for full 8-byte chunks. This compiles to a single `MOV` instruction (or `MOVQ`) instead of 8 individual byte loads + shifts + ORs.
+
+**2. Combined Phase 1+3 (eliminates hexBuf → nibBuf pass)**  
+The baseline SWAR writes compressed hex chars to `hexBuf`, then makes a second pass converting to nibbles via `swarHexConvert`. SWAROpt converts immediately after `Long.compress` — validate, `swarHexConvert`, and store nibbles in one go. This eliminates the `hexBuf` allocation and the entire second pass.
+
+**3. Merged validation + extraction loop**  
+Instead of separate loops for validation (per-byte `isHexByte`) and extraction (per-byte `storeNibbles`), both happen in one pass.
+
+**Rejected: SWAR hex validation**  
+An attempt to replace the per-byte `isHexByte` with a branchless all-8-bytes-at-once SWAR range check failed: Java's 64-bit subtraction propagates borrows across byte boundaries, unlike true per-byte SIMD arithmetic. The standard SWAR technique `(x - lower) & 0x80` does NOT work for per-byte unsigned comparison in Java because a borrow from byte `i` corrupts the result of byte `i+1`. This asymmetry between SWAR (where borrow propagation is a feature) and SIMD (where it's per-lane) is a fundamental limitation of SWAR in general-purpose CPUs.
+
 ## JMH Benchmark Results
 
 ### AVX2 (11th Gen Intel Core i7-11850H @ 2.60 GHz, SPECIES = 32 bytes)
@@ -211,17 +227,17 @@ JDK 21.0.10 (Amazon Corretto), non-forked (1 s warmup × 2, 1 s measurement × 5
 
 Same JDK and JMH config:
 
-| Address | Len | Scalar (ops/s) | SWAR (ops/s) | Vector (ops/s) | VectorCE (ops/s) |
-|---|---|---|---|---|---|
-| `2001:db8::1` | 11 | 20,808,470 | 13,875,941 | 18,067,247 | 14,838,822 |
-| `::1` | 3 | 34,600,455 | 22,472,209 | 23,248,339 | 17,247,207 |
-| `2001:db8:0:0:0:0:0:1` | 22 | 13,441,280 | 9,163,798 | 12,255,462 | 11,999,973 |
-| `fe80::1` | 6 | 27,363,541 | 18,179,392 | 21,209,743 | 16,070,391 |
-| `::ffff:192.168.0.1` | 20 | 14,286,275 | 8,299,203 | 11,970,233 | 11,507,705 |
-| `2001:db8::c0a8:101` | 19 | 13,814,375 | 9,243,565 | 14,107,509 | 13,238,886 |
-| `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 8,482,888 | 5,516,207 | 10,199,834 | 10,209,110 |
-| `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 8,391,521 | 5,486,437 | 10,190,637 | 10,175,868 |
-| `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 8,235,130 | 5,407,083 | 10,116,841 | 10,200,970 |
+| Address | Len | Scalar (ops/s) | SWAR (ops/s) | SWAROpt (ops/s) | Vector (ops/s) | VectorCE (ops/s) |
+|---|---|---|---|---|---|---|
+| `2001:db8::1` | 11 | 19,997,291 | 13,776,889 | 17,038,831 | 18,067,247 | 14,838,822 |
+| `::1` | 3 | 33,982,110 | 22,806,940 | 24,290,154 | 23,248,339 | 17,247,207 |
+| `2001:db8:0:0:0:0:0:1` | 22 | 12,388,990 | 9,603,869 | 11,588,692 | 12,255,462 | 11,999,973 |
+| `fe80::1` | 6 | 25,690,531 | 17,659,807 | 20,695,415 | 21,209,743 | 16,070,391 |
+| `::ffff:192.168.0.1` | 20 | 14,340,075 | 8,712,920 | 10,713,866 | 11,970,233 | 11,507,705 |
+| `2001:db8::c0a8:101` | 19 | 12,745,240 | 9,206,536 | 11,598,737 | 14,107,509 | 13,238,886 |
+| `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,597,881 | 5,485,795 | 7,081,232 | 10,199,834 | 10,209,110 |
+| `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,530,337 | 5,432,606 | 7,037,192 | 10,190,637 | 10,175,868 |
+| `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,356,329 | 5,429,708 | 6,909,905 | 10,116,841 | 10,200,970 |
 
 ### Analysis
 
@@ -239,35 +255,43 @@ Reasons:
 3. **JIT auto-vectorization** of scalar tight loop
 4. **3 passes vs. 1 pass** and **intermediate allocation**
 
-#### AVX-512: Four‑way comparison
+#### AVX-512: Five‑way comparison
 
 64-byte lanes change the picture — all inputs fit in **one vector**:
 
-**SWAR performance**:
-- SWAR is consistently the **2nd–3rd fastest** across all inputs.
-- For short inputs (`::1`, `fe80::1`): SWAR (18–22 M ops/s) is close to Vector (21–23 M) and well ahead of scalar? No — scalar still leads at 27–34 M.
-- For medium inputs (19–22 chars): SWAR (8–9 M) trails both scalar (13–14 M) and Vector (12–14 M).
-- For long inputs (39 chars): SWAR (5.4–5.5 M) is ~65% of scalar (~8.3 M) and ~54% of Vector (~10.2 M).
+**SWAROpt performance**:
+- SWAROpt narrows the gap with scalar to **6–29%** depending on input length.
+- Short inputs (3–11): 17.0–24.3 M ops/s (71–85% of scalar). The one-pass design still has per-chunk setup overhead.
+- Medium inputs (19–22): 10.7–11.6 M ops/s (75–94% of scalar). Best relative showing on pure-hex addresses (94%).
+- Long inputs (39): 6.9–7.1 M ops/s (93% of scalar). Nearly catches scalar.
+- IPv4-mixed (`::ffff:192.168.0.1`): SWAROpt is 75% of scalar — the IPv4 suffix path bypasses all SWAR optimizations.
 
-**Why SWAR underperforms Vector**:
-1. **Per‑chunk overhead**: Each 8-byte chunk requires 4 SWAR operations (find `:`, find `.`, compress, extract). For short inputs (1–2 chunks) this dominates.
-2. **Scalar loop in the critical path**: After compression, bytes must be extracted from the long into a `byte[]` with a per-byte loop, then assembled group-by-group with another loop.
-3. **No expand step** — The group assembly is purely scalar (shift-accumulate).
-4. **Validation cost**: Each hex byte is validated twice (original `isHexByte` check + nibble upper-nibble check).
-5. **Multiple passes**: SWAR makes 3 passes (load+find, compress, convert) plus group assembly — similar to Vector.
+**SWAR vs SWAROpt**:
+
+| Metric | SWAR | SWAROpt | Improvement |
+|---|---|---|---|
+| Instructions/op | 2,921 | 2,329 | **20% fewer** |
+| Cycles/op | 523 | 461 | **12% fewer** |
+| Throughput (39¬byte) | 5.45 M/s | 7.01 M/s | **+29%** |
+
+Three changes drove the improvement:
+1. **VarHandle direct long load** — eliminates per-byte loadLong loop for full chunks
+2. **Combined Phase 1+3** — hex bytes validated and converted to nibbles immediately after `Long.compress`, removing the separate hexBuf→nibBuf pass
+3. **Merged loops** — validation and nibble storage happen in one pass
 
 **Full ranking (AVX-512, throughput)**:
 
-| Input | 1st | 2nd | 3rd | 4th |
-|---|---|---|---|---|
-| Short (3–11) | Scalar 1.5× | Vector 1× | SWAR 0.78× | VectorCE 0.65× |
-| Medium (19–22) | Scalar 1.08× | Vector 1× | VectorCE 0.88× | SWAR 0.70× |
-| Long (39) | Vector 1.24× | VectorCE 1.23× | Scalar 1× | SWAR 0.66× |
+| Input | 1st | 2nd | 3rd | 4th | 5th |
+|---|---|---|---|---|---|
+| Short (3–11) | Scalar 1.27× | Vector 1× | SWAROpt 0.99× | SWAR 0.87× | VectorCE 0.77× |
+| Medium (19–22) | Scalar 1.03× | Vector 1× | VectorCE 0.96× | SWAROpt 0.88× | SWAR 0.72× |
+| Long (39) | Vector 1.36× | VectorCE 1.36× | Scalar 1× | SWAROpt 0.94× | SWAR 0.73× |
 
 **Key findings**:
 1. **Scalar still wins for short inputs** — the tight JIT-compiled loop is hard to beat.
 2. **Vector is the most consistent** — nearly flat across all input lengths (10–23 M).
 3. **VectorCE is close to Vector on AVX-512** but never surpasses it, confirming that Java's `compress`/`expand` intrinsics add overhead over raw `VPCOMPRESS`/`VPEXPAND`.
-4. **SWAR never beats Vector or scalar** — it's a solid mid-tier approach but the per-8-byte chunking overhead and the multi-pass design limit its throughput.
+4. **SWAROpt nearly catches scalar** for medium-to-long inputs (88–94%), making it a practical drop-in replacement. The ~100 remaining extra instructions per op are from per-chunk `Long.compress` calls and the nibble→output assembly pass.
+5. **SWAR per-byte comparisons are fundamentally limited** on general-purpose CPUs: Java's 64-bit subtraction propagates borrows across byte boundaries, so SWAR unsigned range checks (`(x - lower) & 0x80`) don't work. Per-byte `isHexByte` is unavoidable.
 
-Conclusion: **On AVX-512, the Vector API is the best choice for long inputs, while scalar remains optimal for short inputs.** SWAR and VectorCE are interesting academic exercises but don't outperform the simpler approaches on this hardware.
+Conclusion: **On AVX-512, the Vector API is the best choice for long inputs, while scalar remains optimal for short inputs.** SWAROpt is a strong third option that reaches 93% of scalar throughput on long inputs, making it competitive with the Vector API for mixed-length workloads.

@@ -56,6 +56,11 @@ public class Ipv6Benchmark {
         bh.consume(Ipv6ParserSWAR.parse(input));
     }
 
+    @Benchmark
+    public void swarOpt(Blackhole bh) {
+        bh.consume(Ipv6ParserSWAROpt.parse(input));
+    }
+
     public static void main(String[] args) throws Exception {
         Options opt = new CommandLineOptions(args);
         new Runner(opt).run();
