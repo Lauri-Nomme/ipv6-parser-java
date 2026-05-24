@@ -8,8 +8,8 @@ ipv6parse/jmh_generated/Ipv6Benchmark_jmhType_B2.class
 ipv6parse/Ipv6ParserVector.class
 META-INF/BenchmarkList
 ipv6parse/jmh_generated/Ipv6Benchmark_jmhType_B3.class
-ipv6parse/jmh_generated/Ipv6Benchmark_jmhType.class
 ipv6parse/jmh_generated/Ipv6Benchmark_vector_jmhTest.class
+ipv6parse/jmh_generated/Ipv6Benchmark_jmhType.class
 ipv6parse/Ipv6Benchmark.class
 ipv6parse/jmh_generated/Ipv6Benchmark_jmhType_B1.class
 ipv6parse/jmh_generated/Ipv6Benchmark_swarOpt_jmhTest.class

@@ -3,6 +3,7 @@ package ipv6parse;
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.VectorMask;
 import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorShuffle;
 import jdk.incubator.vector.VectorSpecies;
 
 /**
@@ -22,12 +23,16 @@ public class Ipv6ParserVectorCE {
 
     static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_PREFERRED;
     static final int SL = SPECIES.length();
-    private static final ByteVector Z0 = ByteVector.broadcast(SPECIES, (byte) '0');
-    private static final ByteVector A  = ByteVector.broadcast(SPECIES, (byte) 'A');
-    private static final ByteVector F  = ByteVector.broadcast(SPECIES, (byte) 'F');
-    private static final ByteVector a  = ByteVector.broadcast(SPECIES, (byte) 'a');
-    private static final ByteVector f  = ByteVector.broadcast(SPECIES, (byte) 'f');
-    private static final ByteVector N1 = ByteVector.broadcast(SPECIES, (byte) -1);
+    private static final ByteVector LUT_LO, LUT_HI;
+    static {
+        byte[] lo = new byte[64], hi = new byte[64];
+        for (int i = 0; i < 64; i++) lo[i] = hi[i] = -1;
+        for (int i = '0'; i <= '9'; i++) lo[i] = (byte)(i - '0');
+        for (int i = 'A'; i <= 'F'; i++) hi[i - 64] = (byte)(i - 'A' + 10);
+        for (int i = 'a'; i <= 'f'; i++) hi[i - 64] = (byte)(i - 'a' + 10);
+        LUT_LO = ByteVector.fromArray(SPECIES, lo, 0);
+        LUT_HI = ByteVector.fromArray(SPECIES, hi, 0);
+    }
 
     public static byte[] parse(byte[] input) {
         return parse(input, 0, input.length);
@@ -237,20 +242,7 @@ public class Ipv6ParserVectorCE {
     // ────────────────────────────────────────────────────────────────
 
     static ByteVector hexConvert(ByteVector v) {
-        ByteVector v0 = v.sub(Z0);
-
-        VectorMask<Byte> digit = v0.compare(VectorOperators.GE, (byte) 0)
-                      .and(v0.compare(VectorOperators.LE, (byte) 9));
-        VectorMask<Byte> upper = v.compare(VectorOperators.GE, A)
-                      .and(v.compare(VectorOperators.LE, F));
-        VectorMask<Byte> lower = v.compare(VectorOperators.GE, a)
-                      .and(v.compare(VectorOperators.LE, f));
-
-        ByteVector r = N1;
-        r = r.blend(v0, digit);
-        r = r.blend(v0.sub((byte) 7),  upper);
-        r = r.blend(v0.sub((byte) 39), lower);
-        return r;
+        return LUT_LO.rearrange(v.toShuffle(), LUT_HI);
     }
 
     // ────────────────────────────────────────────────────────────────

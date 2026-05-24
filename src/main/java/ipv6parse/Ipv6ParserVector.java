@@ -3,18 +3,23 @@ package ipv6parse;
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.VectorMask;
 import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorShuffle;
 import jdk.incubator.vector.VectorSpecies;
 
 public class Ipv6ParserVector {
 
     static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_PREFERRED;
     static final int SL = SPECIES.length();
-    private static final ByteVector Z0 = ByteVector.broadcast(SPECIES, (byte) '0');
-    private static final ByteVector A  = ByteVector.broadcast(SPECIES, (byte) 'A');
-    private static final ByteVector F  = ByteVector.broadcast(SPECIES, (byte) 'F');
-    private static final ByteVector a  = ByteVector.broadcast(SPECIES, (byte) 'a');
-    private static final ByteVector f  = ByteVector.broadcast(SPECIES, (byte) 'f');
-    private static final ByteVector N1 = ByteVector.broadcast(SPECIES, (byte) -1);
+    private static final ByteVector LUT_LO, LUT_HI;
+    static {
+        byte[] lo = new byte[64], hi = new byte[64];
+        for (int i = 0; i < 64; i++) lo[i] = hi[i] = -1;
+        for (int i = '0'; i <= '9'; i++) lo[i] = (byte)(i - '0');
+        for (int i = 'A'; i <= 'F'; i++) hi[i - 64] = (byte)(i - 'A' + 10);
+        for (int i = 'a'; i <= 'f'; i++) hi[i - 64] = (byte)(i - 'a' + 10);
+        LUT_LO = ByteVector.fromArray(SPECIES, lo, 0);
+        LUT_HI = ByteVector.fromArray(SPECIES, hi, 0);
+    }
 
     public static byte[] parse(byte[] input) {
         return parse(input, 0, input.length);
@@ -145,7 +150,8 @@ public class Ipv6ParserVector {
     }
 
     /** Convert every byte to its hex nibble (0-15), validating during the
-     *  vector pass. Returns null if any non-delimiter byte is invalid. */
+     *  vector pass. Returns null if any non-delimiter byte is invalid.
+     *  Uses vpermb (via rearrange) for single-instruction hex conversion. */
     static byte[] convertHex(byte[] buf, int off, int len,
                              long colonBits, long dotBits) {
         byte[] out = new byte[len];
@@ -156,20 +162,8 @@ public class Ipv6ParserVector {
             int vl = Math.min(SL, remain);
             VectorMask<Byte> lm = SPECIES.indexInRange(0, vl);
 
-            ByteVector v  = ByteVector.fromArray(SPECIES, buf, off + i, lm);
-            ByteVector v0 = v.sub(Z0);
-
-            VectorMask<Byte> digit = v0.compare(VectorOperators.GE, (byte) 0)
-                .and(v0.compare(VectorOperators.LE, (byte) 9));
-            VectorMask<Byte> upper = v.compare(VectorOperators.GE, A)
-                .and(v.compare(VectorOperators.LE, F));
-            VectorMask<Byte> lower = v.compare(VectorOperators.GE, a)
-                .and(v.compare(VectorOperators.LE, f));
-
-            ByteVector r = N1;
-            r = r.blend(v0,       digit);
-            r = r.blend(v0.sub((byte) 7),  upper);
-            r = r.blend(v0.sub((byte) 39), lower);
+            ByteVector v = ByteVector.fromArray(SPECIES, buf, off + i, lm);
+            ByteVector r = LUT_LO.rearrange(v.toShuffle(), LUT_HI);
 
             // validate during conversion: check non-delimiter bytes for -1
             long invalidBits = r.compare(VectorOperators.LT, (byte) 0).toLong();
