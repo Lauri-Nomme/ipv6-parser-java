@@ -295,15 +295,20 @@ Reasons:
 - Long inputs (39): 8.4 M ops/s (**110% of scalar**). SWAROpt now exceeds scalar on long inputs.
 - IPv4-mixed (`::ffff:192.168.0.1`): SWAROpt is 80% of scalar — the IPv4 suffix path bypasses all SWAR optimizations.
 
-**SWAR vs SWAROpt** (AVX-512 i9-11950H, 2+5 iterations, 1 s each):
+**SWAR vs SWAROpt** (AVX-512 i9-11950H, `perf stat` via JMH `-prof perfnorm`, 1 fork × 1 s, 39-byte address):
 
 | Metric | SWAR | SWAROpt | Improvement |
 |---|---|---|---|
-| Throughput (39­byte) | 5.68 M/s | 8.38 M/s | **+47%** |
-| Throughput (22­byte) | 9.73 M/s | 12.62 M/s | **+30%** |
-| Throughput (11­byte) | 14.43 M/s | 17.37 M/s | **+20%** |
+| Throughput | 5.62 M/s | 8.93 M/s | **+59%** |
+| Instructions/op | 4,569 | 2,790 | **-39%** |
+| Cycles/op | 993 | 585 | **-41%** |
+| IPC | 4.60 | 4.77 | +4% |
+| Branches/op | 671 | 358 | **-47%** |
+| Branch misses/op | 0.875 | 0.042 | **-95%** |
+| L1-dcache-loads/op | 726 | 383 | -47% |
+| L1-dcache-stores/op | 281 | 159 | -43% |
 
-The SWAR validation improvements widened the gap vs the previous SWAROpt (which was +29% on 39-byte). On the longest inputs, SWAR hex validation and borrow-safe `swarHexConvert` save ~700 ops/byte vs per-byte `isHexByte` loop.
+The SWAR validation improvements widened the gap vs the previous SWAROpt (which was +29% on 39-byte). The per-byte `isHexByte` loop in the old SWAROpt was replaced with `swarIsHexMask` — a branchless SWAR range check that eliminated **95% of branch mispredictions** (0.875 → 0.042/op). Combined with the borrow-safe `swarHexConvert` fix and the existing optimizations, SWAROpt now uses 39% fewer instructions and 41% fewer cycles than SWAR. See [`SWAR_HEX_VALIDATION.md`](SWAR_HEX_VALIDATION.md) for a detailed explanation of the borrow-canceling paired subtraction technique.
 
 Five changes drove the improvement:
 1. **VarHandle direct long load** — eliminates per-byte loadLong loop for full chunks
