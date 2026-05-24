@@ -23,15 +23,17 @@ public class Ipv6ParserVectorCE {
 
     static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_PREFERRED;
     static final int SL = SPECIES.length();
-    private static final ByteVector LUT_LO, LUT_HI;
+    // Single 64-entry LUT — we shift hi-bytes down before shuffling so
+    // indices are always in [0, 64).  Digits stay at their ASCII positions
+    // ('0'-'9' → 48-57), while 'A'-'F' (65-70) → 1-6 and 'a'-'f' (97-102) → 33-38.
+    private static final ByteVector LUT;
     static {
-        byte[] lo = new byte[64], hi = new byte[64];
-        for (int i = 0; i < 64; i++) lo[i] = hi[i] = -1;
-        for (int i = '0'; i <= '9'; i++) lo[i] = (byte)(i - '0');
-        for (int i = 'A'; i <= 'F'; i++) hi[i - 64] = (byte)(i - 'A' + 10);
-        for (int i = 'a'; i <= 'f'; i++) hi[i - 64] = (byte)(i - 'a' + 10);
-        LUT_LO = ByteVector.fromArray(SPECIES, lo, 0);
-        LUT_HI = ByteVector.fromArray(SPECIES, hi, 0);
+        byte[] lut = new byte[64];
+        for (int i = 0; i < 64; i++) lut[i] = -1;
+        for (int i = '0'; i <= '9'; i++) lut[i] = (byte)(i - '0');
+        for (int i = 'A'; i <= 'F'; i++) lut[i - 64] = (byte)(i - 'A' + 10);
+        for (int i = 'a'; i <= 'f'; i++) lut[i - 64] = (byte)(i - 'a' + 10);
+        LUT = ByteVector.fromArray(SPECIES, lut, 0);
     }
 
     public static byte[] parse(byte[] input) {
@@ -242,7 +244,9 @@ public class Ipv6ParserVectorCE {
     // ────────────────────────────────────────────────────────────────
 
     static ByteVector hexConvert(ByteVector v) {
-        return LUT_LO.rearrange(v.toShuffle(), LUT_HI);
+        VectorMask<Byte> isHi = v.compare(VectorOperators.GE, (byte) 64);
+        ByteVector idx = v.blend(v.sub((byte) 64), isHi);
+        return LUT.rearrange(idx.toShuffle());
     }
 
     // ────────────────────────────────────────────────────────────────

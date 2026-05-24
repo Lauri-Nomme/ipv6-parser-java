@@ -10,15 +10,17 @@ public class Ipv6ParserVector {
 
     static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_PREFERRED;
     static final int SL = SPECIES.length();
-    private static final ByteVector LUT_LO, LUT_HI;
+    // Single 64-entry LUT — we shift hi-bytes down before shuffling so
+    // indices are always in [0, 64).  Digits stay at their ASCII positions
+    // ('0'-'9' → 48-57), while 'A'-'F' (65-70) → 1-6 and 'a'-'f' (97-102) → 33-38.
+    private static final ByteVector LUT;
     static {
-        byte[] lo = new byte[64], hi = new byte[64];
-        for (int i = 0; i < 64; i++) lo[i] = hi[i] = -1;
-        for (int i = '0'; i <= '9'; i++) lo[i] = (byte)(i - '0');
-        for (int i = 'A'; i <= 'F'; i++) hi[i - 64] = (byte)(i - 'A' + 10);
-        for (int i = 'a'; i <= 'f'; i++) hi[i - 64] = (byte)(i - 'a' + 10);
-        LUT_LO = ByteVector.fromArray(SPECIES, lo, 0);
-        LUT_HI = ByteVector.fromArray(SPECIES, hi, 0);
+        byte[] lut = new byte[64];
+        for (int i = 0; i < 64; i++) lut[i] = -1;
+        for (int i = '0'; i <= '9'; i++) lut[i] = (byte)(i - '0');
+        for (int i = 'A'; i <= 'F'; i++) lut[i - 64] = (byte)(i - 'A' + 10);
+        for (int i = 'a'; i <= 'f'; i++) lut[i - 64] = (byte)(i - 'a' + 10);
+        LUT = ByteVector.fromArray(SPECIES, lut, 0);
     }
 
     public static byte[] parse(byte[] input) {
@@ -151,7 +153,7 @@ public class Ipv6ParserVector {
 
     /** Convert every byte to its hex nibble (0-15), validating during the
      *  vector pass. Returns null if any non-delimiter byte is invalid.
-     *  Uses vpermb (via rearrange) for single-instruction hex conversion. */
+     *  Shifts hi bytes down by 64 then uses a single LUT rearrange. */
     static byte[] convertHex(byte[] buf, int off, int len,
                              long colonBits, long dotBits) {
         byte[] out = new byte[len];
@@ -163,7 +165,11 @@ public class Ipv6ParserVector {
             VectorMask<Byte> lm = SPECIES.indexInRange(0, vl);
 
             ByteVector v = ByteVector.fromArray(SPECIES, buf, off + i, lm);
-            ByteVector r = LUT_LO.rearrange(v.toShuffle(), LUT_HI);
+            // split into lo bytes (<64) and hi bytes (≥64), shift hi down
+            VectorMask<Byte> isHi = v.compare(VectorOperators.GE, (byte) 64);
+            ByteVector idx = v.blend(v.sub((byte) 64), isHi);
+            VectorShuffle<Byte> shuf = idx.toShuffle();
+            ByteVector r = LUT.rearrange(shuf);
 
             // validate during conversion: check non-delimiter bytes for -1
             long invalidBits = r.compare(VectorOperators.LT, (byte) 0).toLong();

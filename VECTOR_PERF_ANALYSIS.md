@@ -168,10 +168,20 @@ The C code is just `_mm512_cmpeq_epu8_mask(str, colon)` — one intrinsic call d
 
 The broadcast operations for constants (`ByteVector.broadcast(SPECIES, (byte)'0')`) create new vector values each time. The C code uses `_mm512_set1_epi8('0')` which is folded at compile time into an embedded constant in the instruction encoding.
 
-**Concrete example**: The hex conversion in `convertHex` (lines 152-178 of Ipv6ParserVector):
+**Update**: The hex conversion was later optimized to use a single-LUT `rearrange` (compile to `vpermb`), replacing the 13-op chain with 5 ops:
 
 ```java
-ByteVector v0 = v.sub(Z0);                                                     // 1 vector sub
+VectorMask<Byte> isHi = v.compare(VectorOperators.GE, (byte) 64);      // 1 compare
+ByteVector idx = v.blend(v.sub((byte) 64), isHi);                       // 1 sub + 1 blend
+ByteVector nibs = LUT.rearrange(idx.toShuffle());                       // 1 rearrange → vpermb
+```
+
+This brings hex conversion much closer to C's `_mm512_permutex2var_epi8` — the remaining overhead is the shift+blend workaround for `toShuffle()`'s range limitation on JDK 21.
+
+**Original code** (now replaced) — the 13-op compare+blend chain:
+
+```java
+ByteVector v0 = v.sub(Z0);                                                     // 1 sub
 VectorMask<Byte> digit = v0.compare(VectorOperators.GE, (byte) 0)
     .and(v0.compare(VectorOperators.LE, (byte) 9));                           // 2 compares + 1 and
 VectorMask<Byte> upper = v.compare(VectorOperators.GE, A)
@@ -228,7 +238,7 @@ __mmask32 expand_mask = _mm256_movepi8_mask(
 
 | Component | C AVX-512 | Java VectorCE | Factor |
 |-----------|-----------|---------------|--------|
-| Hex conversion | 1 (`vpermw`) | 13 vector ops (compares + blends + subs) | 13× |
+| Hex conversion | 1 (`vpermb`) | 5 vector ops (sub + compare + blend + rearrange) | 5× |
 | Validation | 1 (`vpmovb2m`) | bit-scan loop + array read + branch | ~20× |
 | Group size computation | ~5 vector + 8 scalar | 6 scalar loops + 4 array allocs | ~40× |
 | Expand mask | 2 (`permutevar` + `movepi8`) | scalar bit loop per digit | ~30× |
@@ -294,18 +304,21 @@ Vector API broadcasts inside `convertHex` are re-executed every call. They shoul
 
 The `parse` method is too large for optimal C2 compilation. Split so the success path (which is hot) gets more aggressive optimization, while error paths (cold) are separated.
 
-### 7. Hex conversion via lookup table
+### 7. Hex conversion via lookup table (applied)
 
-The `_mm512_permutex2var_epi8` approach does hex conversion in 1 instruction. Java Vector API has `ByteVector::rearrange` which compiles to `vpermb`/`vpermw` on AVX-512. This could replace the 13-op compare+blend chain:
+The `_mm512_permutex2var_epi8` approach does hex conversion in 1 instruction. We replaced the 13-op compare+blend chain with a single-LUT `rearrange`, but with a critical workaround:
+
+**The `toShuffle` range problem**: `ByteVector.toShuffle()` on JDK 21 validates shuffle indices against `VLENGTH` (64 for `Byte512Vector`), throwing `IllegalArgumentException` for any byte value ≥ 64. This means the two-table form `lo.rearrange(v.toShuffle(), hi)` crashes on uppercase/lowercase hex chars (A-F = 65-70, a-f = 97-102).
+
+**Workaround**: Subtract 64 from bytes ≥ 64 before creating the shuffle, then use a single 64-entry LUT:
 
 ```java
-// Two 64-entry lookup tables (bytes are nibble value or -1)
-ByteVector lo = ByteVector.fromArray(SPECIES, LOOKUP_LO, 0);
-ByteVector hi = ByteVector.fromArray(SPECIES, LOOKUP_HI, 0);
-ByteVector nibs = lo.rearrange(v.toShuffle(), hi);  // → vpermb
+VectorMask<Byte> isHi = v.compare(VectorOperators.GE, (byte) 64);
+ByteVector idx = v.blend(v.sub((byte) 64), isHi);
+ByteVector nibs = LUT.rearrange(idx.toShuffle());
 ```
 
-This is the closest Java gets to `_mm512_permutex2var_epi8`. Initial testing showed no improvement (Vector API `rearrange` overhead swamped the gain), but it may benefit from more careful implementation.
+This is 5 vector ops (compare, sub, blend, toShuffle, rearrange) vs 13 for the original compare+blend chain. The single `rearrange` compiles to `vpermb` on AVX-512, giving the same hardware instruction as C's `_mm512_permutex2var_epi8`.
 
 ### 8. Fuse the entire hex pipeline into a single small method
 

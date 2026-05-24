@@ -122,7 +122,7 @@ The [`Ipv6ParserVector.java`](src/main/java/ipv6parse/Ipv6ParserVector.java) cla
 |---|---|---|
 | Colon detection | `_mm512_cmpeq_epu8_mask` → 64-bit bitmask | `ByteVector::compare(EQ, ':')` → `toLong()` |
 | Dot detection | same approach | same approach |
-| Hex conversion | `_mm512_permutex2var_epi8` lookup table | `sub/blend` arithmetic (3 range checks + blends) |
+| Hex conversion | `_mm512_permutex2var_epi8` lookup table | single-LUT `rearrange` (shift+blend + `vpermb`) |
 | Compress/expand | `maskz_compress/expand_epi8` | **not available** → scalar fallback |
 | Group assembly | `_mm256_maddubs_epi16` → `cvtepi16_epi8` | **not available** → scalar shift-accumulate |
 
@@ -258,15 +258,17 @@ Same JDK and JMH config:
 
 | Address | Len | Scalar (ops/s) | SWAR (ops/s) | SWAROpt (ops/s) | Vector (ops/s) | VectorCE (ops/s) |
 |---|---|---|---|---|---|---|
-| `2001:db8::1` | 11 | 19,997,291 | 14,430,420 | 17,367,396 | 18,067,247 | 14,838,822 |
-| `::1` | 3 | 33,982,110 | 22,610,790 | 23,952,686 | 23,248,339 | 17,247,207 |
-| `2001:db8:0:0:0:0:0:1` | 22 | 12,388,990 | 9,734,620 | 12,615,082 | 12,255,462 | 11,999,973 |
-| `fe80::1` | 6 | 25,690,531 | 18,639,502 | 21,866,249 | 21,209,743 | 16,070,391 |
-| `::ffff:192.168.0.1` | 20 | 14,340,075 | 8,955,212 | 11,534,825 | 11,970,233 | 11,507,705 |
-| `2001:db8::c0a8:101` | 19 | 12,745,240 | 9,550,051 | 12,436,892 | 14,107,509 | 13,238,886 |
-| `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,597,881 | 5,730,584 | 8,399,369 | 10,199,834 | 10,209,110 |
-| `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,530,337 | 5,678,687 | 8,390,723 | 10,190,637 | 10,175,868 |
-| `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,356,329 | 5,595,413 | 8,357,043 | 10,116,841 | 10,200,970 |
+| `2001:db8::1` | 11 | 20,476,956 | 14,430,420 | 17,367,396 | 20,074,410 | 16,363,587 |
+| `::1` | 3 | 33,981,524 | 22,610,790 | 23,952,686 | 24,433,716 | 19,163,961 |
+| `2001:db8:0:0:0:0:0:1` | 22 | 12,272,839 | 9,734,620 | 12,615,082 | 14,999,629 | 12,641,302 |
+| `fe80::1` | 6 | 25,803,195 | 18,639,502 | 21,866,249 | 23,255,293 | 18,674,314 |
+| `::ffff:192.168.0.1` | 20 | 14,090,521 | 8,955,212 | 11,534,825 | 12,555,116 | 12,253,665 |
+| `2001:db8::c0a8:101` | 19 | 12,755,046 | 9,550,051 | 12,436,892 | 15,492,149 | 13,934,134 |
+| `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,482,555 | 5,730,584 | 8,399,369 | 11,707,005 | 11,180,723 |
+| `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | 11,636,546 | 11,215,749 |
+| `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | 11,730,587 | 11,161,607 |
+
+*Updated benchmark values reflect the LUT-based hex conversion (Iteration 3.1), replacing the 13-op compare+blend chain with a 5-op shift+blend+LUT `rearrange`. Vector on 39-byte inputs improved from ~1.35× to ~1.56× vs scalar (+16%), and VectorCE from ~1.35× to ~1.49× (+10%). SWAR/SWAROpt unchanged.*
 
 ### Analysis
 
@@ -321,16 +323,18 @@ Five changes drove the improvement:
 
 | Input | 1st | 2nd | 3rd | 4th | 5th |
 |---|---|---|---|---|---|
-| Short (3–11) | Scalar 1.27× | SWAROpt 1.03× | Vector 1× | SWAR 0.87× | VectorCE 0.77× |
-| Medium (19–22) | SWAROpt 1.04× | Scalar 1.01× | VectorCE 0.98× | Vector 1× | SWAR 0.72× |
-| Long (39) | Vector 1.36× | VectorCE 1.36× | SWAROpt 1.12× | Scalar 1× | SWAR 0.75× |
+| Short (3–11) | Scalar 1.23× | Vector 1.01× | SWAROpt 0.99× | VectorCE 0.80× | SWAR 0.73× |
+| Medium (19–22) | Vector 1.13× | SWAROpt 1.03× | VectorCE 0.96× | Scalar 1× | SWAR 0.75× |
+| Long (39) | Vector **1.58×** | VectorCE **1.50×** | SWAROpt 1.12× | Scalar 1× | SWAR 0.75× |
+
+*Rankings updated after LUT-based hex conversion. Vector and VectorCE improved significantly on long inputs (from ~1.35× to ~1.58× and ~1.50× vs scalar respectively).*
 
 **Key findings**:
-1. **Scalar still wins for short inputs** — the tight JIT-compiled loop is hard to beat.
-2. **SWAROpt now leads on medium inputs** (19–22 bytes), outperforming scalar by 4% and Vector by 4%.
-3. **SWAROpt exceeds scalar on long inputs** — at **1.12× scalar**, it's the best non-Vector option.
-4. **Vector is the most consistent** — nearly flat across all input lengths (10–23 M).
-5. **VectorCE is close to Vector on AVX-512** but never surpasses it, confirming that Java's `compress`/`expand` intrinsics add overhead over raw `VPCOMPRESS`/`VPEXPAND`.
+1. **Vector now leads on medium and long inputs** — overtaking SWAROpt on 19–22 byte addresses (1.13× vs SWAROpt 1.03×) and widening its lead on 39-byte inputs to **1.58×**.
+2. **Scalar still wins on short inputs** (3–11 bytes) — the tight JIT-compiled loop is hard to beat, but Vector now nearly matches it (1.01×).
+3. **VectorCE improved from 1.36× to 1.50×** on long inputs, but remains behind Vector.
+4. **Vector is the most consistent** — nearly flat across all input lengths (12–24 M).
+5. **SWAROpt unchanged** (unchanged by this iteration) at 1.12× scalar on long inputs.
 6. **SWAR hex validation is achievable with borrow-canceling paired subtraction**: While `(x - lower) & 0x80` fails due to byte-level borrow propagation, the paired-subtraction trick (`(v + (0x80-lo)) ^ (v + (0x80-hi))`) cancels the borrow across both operations and gives correct per-byte range membership.
 
-Conclusion: **On AVX-512, SWAROpt is now the best all-rounder** — it leads on medium inputs, beats scalar on long inputs (+12%), and is only 3% behind Vector on the longest addresses. For mixed-length workloads, SWAROpt provides the best balance of throughput across all input sizes.
+Conclusion: **On AVX-512, Vector is now the best all-rounder** — leads on medium (+13%) and long (+58%) inputs, nearly matches scalar on short inputs. The LUT-based `rearrange` fix closed the gap with C's `_mm512_permutex2var_epi8`, making Vector the strongest performer for mixed-length IPv6 parsing workloads.
