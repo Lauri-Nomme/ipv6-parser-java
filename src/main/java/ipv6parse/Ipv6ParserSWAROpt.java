@@ -48,13 +48,10 @@ public class Ipv6ParserSWAROpt {
 
             long compressed = Long.compress(chunk, hexMask);
 
-            // validate and convert to nibbles in one pass
-            long cv = compressed;
-            for (int k = 0; k < nHex; k++) {
-                int b = (int)(cv & 0xFF);
-                if (!isHexByte(b)) return null;
-                cv >>>= 8;
-            }
+            // SWAR validate all hex bytes at once (borrow-safe paired subtraction)
+            long hexBits = swarIsHexMask(compressed);
+            long validMask = -1L >>> (64 - nHex * 8);
+            if ((hexBits & validMask) != (validMask & 0x8080808080808080L)) return null;
 
             long nibbled = swarHexConvert(compressed);
             long nv = nibbled;
@@ -189,16 +186,31 @@ public class Ipv6ParserSWAROpt {
 
     private static long swarHexConvert(long v) {
         long t = v - 0x3030303030303030L;
-        long gt9 = t + 0xF6F6F6F6F6F6F6F6L;
-        long isLetter = ~gt9 & 0x8080808080808080L;
+        long isLetter = (v & 0x4040404040404040L) << 1;
         long adj = (isLetter >>> 5) | (isLetter >>> 6) | (isLetter >>> 7);
         long isLower = t & 0x2020202020202020L;
         return t - (adj | isLower);
     }
 
-    private static boolean isHexByte(int b) {
-        return (b >= '0' && b <= '9') ||
-               (b >= 'A' && b <= 'F') ||
-               (b >= 'a' && b <= 'f');
+    /**
+     * Borrow-safe SWAR hex digit classification.
+     * Returns 0x80 in each byte that is '0'-'9', 'A'-'F', or 'a'-'f'.
+     *
+     * Uses the paired-subtraction cancelation trick: both t = v + (0x80 - lo)
+     * and s = v + (0x80 - hi) absorb the same borrow from lower bytes, so
+     * the XOR (t ^ s) cancels the borrow and gives the correct per-byte
+     * range membership.
+     */
+    private static long swarIsHexMask(long v) {
+        long t_digit = v + 0x5050505050505050L;  // v + (0x80 - '0')
+        long s_digit = v + 0x4646464646464646L;  // v + (0x80 - ('9'+1))
+        long isDigit = (t_digit ^ s_digit) & 0x8080808080808080L;
+
+        long lowered = v | 0x2020202020202020L;
+        long t_letter = lowered + 0x1F1F1F1F1F1F1F1FL;  // + (0x80 - 'a')
+        long s_letter = lowered + 0x1919191919191919L;  // + (0x80 - ('f'+1))
+        long isHexLetter = (t_letter ^ s_letter) & 0x8080808080808080L;
+
+        return isDigit | isHexLetter;
     }
 }

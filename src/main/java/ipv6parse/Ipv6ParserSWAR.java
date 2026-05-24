@@ -237,16 +237,14 @@ public class Ipv6ParserSWAR {
     static long swarHexConvert(long v) {
         long t = v - 0x3030303030303030L;
 
-        // detect bytes > 9 (letters)
-        long gt9 = t + 0xF6F6F6F6F6F6F6F6L;          // t - 10 per byte (unsigned)
-        long isLetter = ~gt9 & 0x8080808080808080L;
+        // detect letters via bit 6 ('A'-'F' / 'a'-'f' have 0x40, '0'-'9' don't)
+        long isLetter = (v & 0x4040404040404040L) << 1;  // → 0x80 per letter byte
 
-        // subtract 7 from letter bytes
+        // subtract 7 from letter bytes (0x80>>>5 | >>>6 | >>>7 = 0x07)
         long adj = (isLetter >>> 5) | (isLetter >>> 6) | (isLetter >>> 7);
         long isLower = t & 0x2020202020202020L;
 
-        long totalAdj = adj | isLower;
-        return t - totalAdj;
+        return t - (adj | isLower);
     }
 
     static boolean isHexByte(int b) {
