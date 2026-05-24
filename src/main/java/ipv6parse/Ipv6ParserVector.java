@@ -9,6 +9,12 @@ public class Ipv6ParserVector {
 
     static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_PREFERRED;
     static final int SL = SPECIES.length();
+    private static final ByteVector Z0 = ByteVector.broadcast(SPECIES, (byte) '0');
+    private static final ByteVector A  = ByteVector.broadcast(SPECIES, (byte) 'A');
+    private static final ByteVector F  = ByteVector.broadcast(SPECIES, (byte) 'F');
+    private static final ByteVector a  = ByteVector.broadcast(SPECIES, (byte) 'a');
+    private static final ByteVector f  = ByteVector.broadcast(SPECIES, (byte) 'f');
+    private static final ByteVector N1 = ByteVector.broadcast(SPECIES, (byte) -1);
 
     public static byte[] parse(byte[] input) {
         return parse(input, 0, input.length);
@@ -148,13 +154,6 @@ public class Ipv6ParserVector {
     /** Convert every byte to its hex nibble (0-15) or -1 if invalid. */
     static byte[] convertHex(byte[] buf, int off, int len) {
         byte[] out = new byte[len];
-
-        ByteVector Z0 = ByteVector.broadcast(SPECIES, (byte) '0');
-        ByteVector A  = ByteVector.broadcast(SPECIES, (byte) 'A');
-        ByteVector F  = ByteVector.broadcast(SPECIES, (byte) 'F');
-        ByteVector a  = ByteVector.broadcast(SPECIES, (byte) 'a');
-        ByteVector f  = ByteVector.broadcast(SPECIES, (byte) 'f');
-        ByteVector N1 = ByteVector.broadcast(SPECIES, (byte) -1);
 
         for (int i = 0; i < len; i += SL) {
             int remain = len - i;

@@ -22,9 +22,12 @@ public class Ipv6ParserVectorCE {
 
     static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_PREFERRED;
     static final int SL = SPECIES.length();
-
-    // reusable scalar convert-hex (single-pass, no intermediate array)
-    private static final Ipv6Parser FALLBACK = new Ipv6Parser();  // not used directly
+    private static final ByteVector Z0 = ByteVector.broadcast(SPECIES, (byte) '0');
+    private static final ByteVector A  = ByteVector.broadcast(SPECIES, (byte) 'A');
+    private static final ByteVector F  = ByteVector.broadcast(SPECIES, (byte) 'F');
+    private static final ByteVector a  = ByteVector.broadcast(SPECIES, (byte) 'a');
+    private static final ByteVector f  = ByteVector.broadcast(SPECIES, (byte) 'f');
+    private static final ByteVector N1 = ByteVector.broadcast(SPECIES, (byte) -1);
 
     public static byte[] parse(byte[] input) {
         return parse(input, 0, input.length);
@@ -175,12 +178,8 @@ public class Ipv6ParserVectorCE {
                                               long colonBits, long dotBits,
                                               int[] grpSizes, boolean hasDot,
                                               byte[] out) {
-        int sl = SL;
-        byte[] padded = new byte[sl];
-        System.arraycopy(input, off, padded, 0, len);
-
         VectorMask<Byte> loadMask = SPECIES.indexInRange(0, len);
-        ByteVector vec = ByteVector.fromArray(SPECIES, padded, 0, loadMask);
+        ByteVector vec = ByteVector.fromArray(SPECIES, input, off, loadMask);
 
         // build compress mask: keep non-':' non-'.' bytes within len
         long delims = colonBits | dotBits;
@@ -223,7 +222,7 @@ public class Ipv6ParserVectorCE {
         ByteVector paddedNibs = nibs.expand(expandMask);
 
         // scalar combine: 2 nibbles → 1 byte
-        byte[] tmp = new byte[sl];
+        byte[] tmp = new byte[SL];
         paddedNibs.intoArray(tmp, 0);
 
         int hexGroups = hasDot ? 6 : 8;
@@ -244,23 +243,16 @@ public class Ipv6ParserVectorCE {
     // ────────────────────────────────────────────────────────────────
 
     static ByteVector hexConvert(ByteVector v) {
-        var Z0 = v.broadcast((byte)'0');
-        var A  = v.broadcast((byte)'A');
-        var F  = v.broadcast((byte)'F');
-        var a  = v.broadcast((byte)'a');
-        var f  = v.broadcast((byte)'f');
-        var N1 = v.broadcast((byte)-1);
+        ByteVector v0 = v.sub(Z0);
 
-        var v0 = v.sub(Z0);
-
-        var digit = v0.compare(VectorOperators.GE, (byte) 0)
+        VectorMask<Byte> digit = v0.compare(VectorOperators.GE, (byte) 0)
                       .and(v0.compare(VectorOperators.LE, (byte) 9));
-        var upper = v.compare(VectorOperators.GE, A)
+        VectorMask<Byte> upper = v.compare(VectorOperators.GE, A)
                       .and(v.compare(VectorOperators.LE, F));
-        var lower = v.compare(VectorOperators.GE, a)
+        VectorMask<Byte> lower = v.compare(VectorOperators.GE, a)
                       .and(v.compare(VectorOperators.LE, f));
 
-        var r = N1;
+        ByteVector r = N1;
         r = r.blend(v0, digit);
         r = r.blend(v0.sub((byte) 7),  upper);
         r = r.blend(v0.sub((byte) 39), lower);
