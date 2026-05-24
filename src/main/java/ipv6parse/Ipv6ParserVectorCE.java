@@ -136,15 +136,9 @@ public class Ipv6ParserVectorCE {
             oi = hasDot ? 12 : 16; // hex part done
         } else {
             // ──── fallback: use the non-compress vector approach ─────
-            byte[] hexVals = Ipv6ParserVector.convertHex(input, off, len);
-            // validate
-            long nonDelim = ((1L << len) - 1) & ~colonBits & ~dotBits;
-            long tmp = nonDelim;
-            while (tmp != 0) {
-                int p = Long.numberOfTrailingZeros(tmp);
-                if (hexVals[p] < 0) return null;
-                tmp &= tmp - 1;
-            }
+            byte[] hexVals = Ipv6ParserVector.convertHex(input, off, len,
+                                                         colonBits, dotBits);
+            if (hexVals == null) return null;
             // iterate over hexVals skipping colons (hexVals is indexed by
             // input position, not by compressed group order)
             int ip = 0;

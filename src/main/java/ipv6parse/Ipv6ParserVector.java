@@ -83,15 +83,8 @@ public class Ipv6ParserVector {
         if (emptyCount == 0 && pad != 0) return null;
 
         // ---- Phase 5: validate & convert every char via vectors ------
-        byte[] hexVals = convertHex(input, off, len);
-
-        long nonDelimBits = ((1L << len) - 1) & ~(colonBits | dotBits);
-        long tmp = nonDelimBits;
-        while (tmp != 0) {
-            int p = Long.numberOfTrailingZeros(tmp);
-            if (hexVals[p] < 0) return null;
-            tmp &= tmp - 1;
-        }
+        byte[] hexVals = convertHex(input, off, len, colonBits, dotBits);
+        if (hexVals == null) return null;
 
         // validate hex segment sizes
         for (int i = 0; i < segs; i++) {
@@ -151,9 +144,12 @@ public class Ipv6ParserVector {
         return result;
     }
 
-    /** Convert every byte to its hex nibble (0-15) or -1 if invalid. */
-    static byte[] convertHex(byte[] buf, int off, int len) {
+    /** Convert every byte to its hex nibble (0-15), validating during the
+     *  vector pass. Returns null if any non-delimiter byte is invalid. */
+    static byte[] convertHex(byte[] buf, int off, int len,
+                             long colonBits, long dotBits) {
         byte[] out = new byte[len];
+        long delims = colonBits | dotBits;
 
         for (int i = 0; i < len; i += SL) {
             int remain = len - i;
@@ -174,6 +170,11 @@ public class Ipv6ParserVector {
             r = r.blend(v0,       digit);
             r = r.blend(v0.sub((byte) 7),  upper);
             r = r.blend(v0.sub((byte) 39), lower);
+
+            // validate during conversion: check non-delimiter bytes for -1
+            long invalidBits = r.compare(VectorOperators.LT, (byte) 0).toLong();
+            long nonDelimInChunk = ((~delims) >>> i) & ((1L << vl) - 1);
+            if ((invalidBits & nonDelimInChunk) != 0) return null;
 
             r.intoArray(out, i, lm);
         }
