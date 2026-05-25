@@ -16,8 +16,8 @@ public class Ipv6ParserVector {
     // ('0'-'9' → 48-57), while 'A'-'F' (65-70) → 1-6 and 'a'-'f' (97-102) → 33-38.
     private static final ByteVector LUT;
     // Shuffles for pairing 32 contiguous nibbles into 16 bytes
-    private static final VectorShuffle<Byte> SHUFFLE_EVEN;
-    private static final VectorShuffle<Byte> SHUFFLE_ODD;
+    static final VectorShuffle<Byte> SHUFFLE_EVEN;
+    static final VectorShuffle<Byte> SHUFFLE_ODD;
     // reusable buffer for hex nibble output (single-threaded use)
     static final byte[] HEX_BUF = new byte[45];
     static {

@@ -183,6 +183,20 @@ public class Ipv6ParserVectorCE {
         long bad = invalid.toLong() & validLanes;
         if (bad != 0) return false;
 
+        // Fast path: all groups span exactly 4 — vector compress+pair
+        boolean allSpan4 = true;
+        for (int gs : grpSizes) {
+            if (gs != 4) { allSpan4 = false; break; }
+        }
+        if (allSpan4) {
+            int hexGroups = hasDot ? 6 : 8;
+            ByteVector evens = nibs.rearrange(Ipv6ParserVector.SHUFFLE_EVEN);
+            ByteVector odds  = nibs.rearrange(Ipv6ParserVector.SHUFFLE_ODD);
+            ByteVector paired = evens.mul((byte) 16).or(odds);
+            paired.intoArray(out, 0, SPECIES.indexInRange(0, hexGroups * 2));
+            return true;
+        }
+
         // build expand mask from group sizes
         long expandBits = 0;
         int bitPos = 0;
