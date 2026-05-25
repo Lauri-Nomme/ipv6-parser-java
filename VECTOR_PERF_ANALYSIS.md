@@ -14,14 +14,14 @@ Our Java on **i9-11950H @ 2.6 GHz** (also Ice Lake, 64-byte vectors) -- **curren
 
 | Parser | 39-byte M/s | vs Scalar | vs C |
 |--------|------------|-----------|------|
-| Scalar | 8.5 | 1x | 0.12x |
-| SWAR | 5.7 | 0.67x | 0.08x |
-| SWAROpt | 8.4 | 0.99x | 0.12x |
-| VectorCE | 11.0 | 1.29x | 0.15x |
-| **Vector** | **50.2** | **5.91x** | **0.70x** |
-| C AVX-512 | 71.3 | ~8.4x | 1x |
+| Scalar | 7.9 | 1x | 0.11x |
+| SWAR | 5.7 | 0.72x | 0.08x |
+| SWAROpt | 8.4 | 1.06x | 0.12x |
+| VectorCE | 15.8 | 2.0x | 0.22x |
+| **Vector** | **49.5** | **6.27x** | **0.69x** |
+| C AVX-512 | 71.3 | ~9.0x | 1x |
 
-**Vector now reaches 70% of C throughput** (up from 9% baseline). The remaining gap: C does the entire pipeline in ~120 instructions, while Java needs ~150+ instructions for the same work.
+**VectorCE compress+pair fast path (Iteration 10) lifted all-span-4 throughput from 11.0 to 15.8 M/s (+44%). Vector unchanged at 70% of C.**
 
 ---
 
@@ -121,7 +121,7 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 
 ## Improvement Ideas (Updated)
 
-### ✅ Implemented in Iterations 3-9
+### ✅ Implemented in Iterations 3-10
 
 | Idea | Iteration | Impact |
 |------|-----------|--------|
@@ -133,7 +133,8 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 | Popcnt elimination (len - nc instead) | 8 | minor (part of +40%) |
 | Skip empty detection when ccPairs == 0 | 8 | minor (part of +40%) |
 | Masked vector store instead of lane extraction | 8 | +12% (39-byte) |
-| **Defer colon position extraction** | **9** | **+28% (39-byte)** |
+| Defer colon position extraction | 9 | +28% (39-byte) |
+| **VectorCE compress+pair fast path** | **10** | **+44% (39-byte VectorCE)** |
 
 ### 🎯 High priority
 
