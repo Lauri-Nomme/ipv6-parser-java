@@ -1,6 +1,7 @@
 package ipv6parse;
 
 import jdk.incubator.vector.ByteVector;
+import jdk.incubator.vector.LongVector;
 import jdk.incubator.vector.VectorMask;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorShuffle;
@@ -14,6 +15,8 @@ public class Ipv6ParserVector {
     // indices are always in [0, 64).  Digits stay at their ASCII positions
     // ('0'-'9' → 48-57), while 'A'-'F' (65-70) → 1-6 and 'a'-'f' (97-102) → 33-38.
     private static final ByteVector LUT;
+    // reusable buffer for hex nibble output (single-threaded use)
+    static final byte[] HEX_BUF = new byte[45];
     static {
         byte[] lut = new byte[64];
         for (int i = 0; i < 64; i++) lut[i] = -1;
@@ -89,44 +92,93 @@ public class Ipv6ParserVector {
         if (emptyCount > 0 && pad < 1) return null;
         if (emptyCount == 0 && pad != 0) return null;
 
-        // ---- Phase 5: validate & convert every char via vectors ------
-        byte[] hexVals = convertHex(input, off, len, colonBits, dotBits);
-        if (hexVals == null) return null;
-
-        // validate hex segment sizes
-        for (int i = 0; i < segs; i++) {
-            boolean isLast = i == segs - 1;
-            boolean isHex  = !isLast || !hasDot;
-            if (segStart[i] < segEnd[i] && isHex) {
-                int span = segEnd[i] - segStart[i];
-                if (span < 1 || span > 4) return null;
-            }
-        }
-
-        // ---- Phase 6: assemble output --------------------------------
+        // ---- Phase 5+6: validate, convert & assemble output ----------
         byte[] out = new byte[16];
         int oi = 0;
         boolean ddInserted = false;
+        long delims = colonBits | dotBits;
 
-        for (int i = 0; i < segs; i++) {
-            boolean isEmpty = segStart[i] == segEnd[i];
-            boolean isLast  = i == segs - 1;
-            boolean isHex   = !isLast || !hasDot;
+        if (len <= SL) {
+            // Single-vector fast path: keep nibbles in register longs
+            VectorMask<Byte> lm = SPECIES.indexInRange(0, len);
+            ByteVector v = ByteVector.fromArray(SPECIES, input, off, lm);
+            VectorMask<Byte> isHi = v.compare(VectorOperators.GE, (byte) 64);
+            ByteVector idx = v.blend(v.sub((byte) 64), isHi);
+            ByteVector r = LUT.rearrange(idx.toShuffle());
 
-            if (isEmpty) {
-                if (!ddInserted) {
-                    for (int p = 0; p < pad; p++) {
-                        out[oi++] = 0; out[oi++] = 0;
+            long invalidBits = r.compare(VectorOperators.LT, (byte) 0).toLong();
+            if ((invalidBits & ((~delims) & ((1L << len) - 1))) != 0) return null;
+
+            LongVector lv = (LongVector) r.reinterpretAsLongs();
+            int nLongs = (len + 7) / 8;
+            long n0 = 0, n1 = 0, n2 = 0, n3 = 0, n4 = 0, n5 = 0;
+            if (nLongs > 0) n0 = lv.lane(0);
+            if (nLongs > 1) n1 = lv.lane(1);
+            if (nLongs > 2) n2 = lv.lane(2);
+            if (nLongs > 3) n3 = lv.lane(3);
+            if (nLongs > 4) n4 = lv.lane(4);
+            if (nLongs > 5) n5 = lv.lane(5);
+
+            for (int i = 0; i < segs; i++) {
+                boolean isEmpty = segStart[i] == segEnd[i];
+                boolean isLast  = i == segs - 1;
+                boolean isHex   = !isLast || !hasDot;
+
+                if (isEmpty) {
+                    if (!ddInserted) {
+                        for (int p = 0; p < pad; p++) { out[oi++] = 0; out[oi++] = 0; }
+                        ddInserted = true;
                     }
-                    ddInserted = true;
+                } else if (isHex) {
+                    int start = segStart[i], span = segEnd[i] - start;
+                    if (span < 1 || span > 4) return null;
+                    int li = start / 8, bo = (start % 8) * 8;
+                    long chunk = switch (li) {
+                        case 0 -> n0; case 1 -> n1; case 2 -> n2;
+                        case 3 -> n3; case 4 -> n4; case 5 -> n5;
+                        default -> 0; } >>> bo;
+                    int hexVal;
+                    switch (span) {
+                        case 1 -> hexVal = (int)(chunk) & 0xFF;
+                        case 2 -> hexVal = ((int)(chunk) & 0xFF) << 4 | ((int)(chunk >>> 8) & 0xFF);
+                        case 3 -> hexVal = ((int)(chunk) & 0xFF) << 8 | ((int)(chunk >>> 8) & 0xFF) << 4 | ((int)(chunk >>> 16) & 0xFF);
+                        case 4 -> hexVal = ((int)(chunk) & 0xFF) << 12 | ((int)(chunk >>> 8) & 0xFF) << 8
+                                        | ((int)(chunk >>> 16) & 0xFF) << 4 | ((int)(chunk >>> 24) & 0xFF);
+                        default -> hexVal = 0;
+                    }
+                    out[oi++] = (byte)(hexVal >> 8);
+                    out[oi++] = (byte)hexVal;
+                } else {
+                    if (dotCount != 3) return null;
+                    ipv4Suffix(input, off + segStart[i], segEnd[i] - segStart[i], out, oi);
+                    oi += 4;
                 }
-            } else if (isHex) {
-                hexGroupFromVals(hexVals, segStart[i], segEnd[i] - segStart[i], out, oi);
-                oi += 2;
-            } else {
-                if (dotCount != 3) return null;
-                ipv4Suffix(input, off + segStart[i], segEnd[i] - segStart[i], out, oi);
-                oi += 4;
+            }
+        } else {
+            // Multi-vector fallback: convert to HEX_BUF, then assemble
+            if (!convertHex(input, off, len, colonBits, dotBits)) return null;
+            for (int i = 0; i < segs; i++) {
+                boolean isEmpty = segStart[i] == segEnd[i];
+                boolean isLast  = i == segs - 1;
+                boolean isHex   = !isLast || !hasDot;
+
+                if (isEmpty) {
+                    if (!ddInserted) {
+                        for (int p = 0; p < pad; p++) { out[oi++] = 0; out[oi++] = 0; }
+                        ddInserted = true;
+                    }
+                } else if (isHex) {
+                    int start = segStart[i], span = segEnd[i] - start;
+                    if (span < 1 || span > 4) return null;
+                    int v = 0;
+                    for (int j = 0; j < span; j++) v = (v << 4) | (HEX_BUF[start + j] & 0xFF);
+                    out[oi++] = (byte)(v >> 8);
+                    out[oi++] = (byte)v;
+                } else {
+                    if (dotCount != 3) return null;
+                    ipv4Suffix(input, off + segStart[i], segEnd[i] - segStart[i], out, oi);
+                    oi += 4;
+                }
             }
         }
 
@@ -152,11 +204,11 @@ public class Ipv6ParserVector {
     }
 
     /** Convert every byte to its hex nibble (0-15), validating during the
-     *  vector pass. Returns null if any non-delimiter byte is invalid.
+     *  vector pass. Returns false if any non-delimiter byte is invalid.
+     *  Results written to HEX_BUF (caller reads from there).
      *  Shifts hi bytes down by 64 then uses a single LUT rearrange. */
-    static byte[] convertHex(byte[] buf, int off, int len,
-                             long colonBits, long dotBits) {
-        byte[] out = new byte[len];
+    static boolean convertHex(byte[] buf, int off, int len,
+                              long colonBits, long dotBits) {
         long delims = colonBits | dotBits;
 
         for (int i = 0; i < len; i += SL) {
@@ -174,19 +226,11 @@ public class Ipv6ParserVector {
             // validate during conversion: check non-delimiter bytes for -1
             long invalidBits = r.compare(VectorOperators.LT, (byte) 0).toLong();
             long nonDelimInChunk = ((~delims) >>> i) & ((1L << vl) - 1);
-            if ((invalidBits & nonDelimInChunk) != 0) return null;
+            if ((invalidBits & nonDelimInChunk) != 0) return false;
 
-            r.intoArray(out, i, lm);
+            r.intoArray(HEX_BUF, i, lm);
         }
-        return out;
-    }
-
-    static void hexGroupFromVals(byte[] vals, int start, int len,
-                                  byte[] out, int oi) {
-        int v = 0;
-        for (int i = 0; i < len; i++) v = (v << 4) | vals[start + i];
-        out[oi]     = (byte)(v >> 8);
-        out[oi + 1] = (byte)(v);
+        return true;
     }
 
     // -----------------------------------------------------------------

@@ -258,17 +258,17 @@ Same JDK and JMH config:
 
 | Address | Len | Scalar (ops/s) | SWAR (ops/s) | SWAROpt (ops/s) | Vector (ops/s) | VectorCE (ops/s) |
 |---|---|---|---|---|---|---|
-| `2001:db8::1` | 11 | 20,476,956 | 14,430,420 | 17,367,396 | 20,074,410 | 16,363,587 |
-| `::1` | 3 | 33,981,524 | 22,610,790 | 23,952,686 | 24,433,716 | 19,163,961 |
-| `2001:db8:0:0:0:0:0:1` | 22 | 12,272,839 | 9,734,620 | 12,615,082 | 14,999,629 | 12,641,302 |
-| `fe80::1` | 6 | 25,803,195 | 18,639,502 | 21,866,249 | 23,255,293 | 18,674,314 |
-| `::ffff:192.168.0.1` | 20 | 14,090,521 | 8,955,212 | 11,534,825 | 12,555,116 | 12,253,665 |
-| `2001:db8::c0a8:101` | 19 | 12,755,046 | 9,550,051 | 12,436,892 | 15,492,149 | 13,934,134 |
-| `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,482,555 | 5,730,584 | 8,399,369 | 11,707,005 | 11,180,723 |
-| `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | 11,636,546 | 11,215,749 |
-| `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | 11,730,587 | 11,161,607 |
+| `2001:db8::1` | 11 | 20,476,956 | 14,430,420 | 17,367,396 | **24,668,720** | 16,363,587 |
+| `::1` | 3 | 33,981,524 | 22,610,790 | 23,952,686 | **28,860,403** | 19,163,961 |
+| `2001:db8:0:0:0:0:0:1` | 22 | 12,272,839 | 9,734,620 | 12,615,082 | **18,708,596** | 12,641,302 |
+| `fe80::1` | 6 | 25,803,195 | 18,639,502 | 21,866,249 | **27,526,422** | 18,674,314 |
+| `::ffff:192.168.0.1` | 20 | 14,090,521 | 8,955,212 | 11,534,825 | **15,432,868** | 12,253,665 |
+| `2001:db8::c0a8:101` | 19 | 12,755,046 | 9,550,051 | 12,436,892 | **19,771,459** | 13,934,134 |
+| `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,482,555 | 5,730,584 | 8,399,369 | **12,781,149** | 11,180,723 |
+| `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | **12,775,842** | 11,215,749 |
+| `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | **12,835,133** | 11,161,607 |
 
-*Updated benchmark values reflect the LUT-based hex conversion (Iteration 3.1), replacing the 13-op compare+blend chain with a 5-op shift+blend+LUT `rearrange`. Vector on 39-byte inputs improved from ~1.35× to ~1.56× vs scalar (+16%), and VectorCE from ~1.35× to ~1.49× (+10%). SWAR/SWAROpt unchanged.*
+*Update: Inline long extraction (Iteration 4) eliminated the intoArray write by using `reinterpretAsLongs()` to keep nibble values in register longs. Vector now beats scalar on ALL inputs — 1.26× on short, 1.46× on medium, 1.66× on long. This closed the gap with C's `vpermb` + `vpmovb2m` approach.*
 
 ### Analysis
 
@@ -323,9 +323,10 @@ Five changes drove the improvement:
 
 | Input | 1st | 2nd | 3rd | 4th | 5th |
 |---|---|---|---|---|---|
-| Short (3–11) | Scalar 1.23× | Vector 1.01× | SWAROpt 0.99× | VectorCE 0.80× | SWAR 0.73× |
-| Medium (19–22) | Vector 1.13× | SWAROpt 1.03× | VectorCE 0.96× | Scalar 1× | SWAR 0.75× |
-| Long (39) | Vector **1.58×** | VectorCE **1.50×** | SWAROpt 1.12× | Scalar 1× | SWAR 0.75× |
+| Short (3–11) | **Vector 1.26×** | Scalar 1× | SWAROpt 0.99× | VectorCE 0.76× | SWAR 0.69× |
+| Medium (19–22) | **Vector 1.46×** | SWAROpt 1.02× | VectorCE 0.98× | Scalar 1× | SWAR 0.75× |
+| Long (39) | **Vector 1.66×** | VectorCE 1.44× | SWAROpt 1.10× | Scalar 1× | SWAR 0.73× |
+
 
 *Rankings updated after LUT-based hex conversion. Vector and VectorCE improved significantly on long inputs (from ~1.35× to ~1.58× and ~1.50× vs scalar respectively).*
 

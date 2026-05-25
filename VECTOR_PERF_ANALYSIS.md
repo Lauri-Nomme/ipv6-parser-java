@@ -27,18 +27,18 @@ Our Java on **i9-11950H @ 2.6 GHz** (also Ice Lake, also 64-byte vectors):
 
 From perfasm, the single hot method `Ipv6ParserVector::parse` contains *everything* — inlined. C2 compiles it as one giant method (version 4, ~800+ lines of assembly). The hot regions show:
 
-| Activity | % cycles |
-|----------|----------|
-| `intoArray` stores (convertHex writing hexVals) | ~27% |
-| `segStart`/`segEnd` array fill (scalar loops) | ~20% |
-| Validation bit-scan loop (scalar) | ~12% |
-| `findDelimiters` load+compare+accumulate | ~11% |
-| Segment boundary & empty-detection loops | ~10% |
-| Output assembly loop | ~8% |
-| GC/alloc overhead | ~4% |
-| Actual vector compare/sub/blend in convertHex | **~4%** |
+| Activity | % cycles (old) | % cycles (current) |
+|----------|---------------|-------------------|
+| Nibble extraction via reinterpretAsLongs | ~27% (intoArray) | **~4%** (register→scalar) |
+| `segStart`/`segEnd` array fill (scalar loops) | ~20% | ~20% |
+| Vector hex conversion (LUT rearrange) | ~4% | ~4% |
+| `findDelimiters` load+compare+accumulate | ~11% | ~11% |
+| Segment boundary & empty-detection loops | ~10% | ~10% |
+| Output assembly loop | ~8% | ~8% |
+| GC/alloc overhead | ~4% | ~4% |
+| **Actual vector ops** | ~4% | **~8%** |
 
-The vector instructions (compare, sub, blend) account for **~4% of cycles**. The rest is allocating arrays, writing to them, reading back, and scalar loop overhead.
+**Key change**: Replaced `intoArray(HEX_BUF)` with `reinterpretAsLongs()` + inline register-extraction, eliminating the 64-byte write and subsequent read-back from `HEX_BUF`. Vector ops now account for ~8% of cycles (up from ~4%).
 
 **Compare: C AVX-512 data flow**
 

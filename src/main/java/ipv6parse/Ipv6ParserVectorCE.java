@@ -27,6 +27,8 @@ public class Ipv6ParserVectorCE {
     // indices are always in [0, 64).  Digits stay at their ASCII positions
     // ('0'-'9' → 48-57), while 'A'-'F' (65-70) → 1-6 and 'a'-'f' (97-102) → 33-38.
     private static final ByteVector LUT;
+    // reusable buffer for nibble extraction (compressExpandPath only, single-threaded)
+    private static final byte[] TMP = new byte[SL];
     static {
         byte[] lut = new byte[64];
         for (int i = 0; i < 64; i++) lut[i] = -1;
@@ -143,18 +145,17 @@ public class Ipv6ParserVectorCE {
             oi = hasDot ? 12 : 16; // hex part done
         } else {
             // ──── fallback: use the non-compress vector approach ─────
-            byte[] hexVals = Ipv6ParserVector.convertHex(input, off, len,
-                                                         colonBits, dotBits);
-            if (hexVals == null) return null;
-            // iterate over hexVals skipping colons (hexVals is indexed by
-            // input position, not by compressed group order)
+            if (!Ipv6ParserVector.convertHex(input, off, len,
+                                             colonBits, dotBits)) return null;
+            // iterate over HEX_BUF skipping colons (indexed by input position,
+            // not by compressed group order)
             int ip = 0;
             for (int g = 0; g < hexGroups; g++) {
                 if (grpSizes[g] == 0) { out[oi++] = 0; out[oi++] = 0; continue; }
                 int v = 0;
                 for (int k = 0; k < grpSizes[g]; k++) {
                     while (ip < len && (colonBits & (1L << ip)) != 0) ip++;
-                    v = (v << 4) | hexVals[ip++];
+                    v = (v << 4) | Ipv6ParserVector.HEX_BUF[ip++];
                 }
                 out[oi++] = (byte)(v >> 8); out[oi++] = (byte)(v);
             }
@@ -222,19 +223,14 @@ public class Ipv6ParserVectorCE {
         // expand → each group has 4 nibbles, leading zeros filled
         ByteVector paddedNibs = nibs.expand(expandMask);
 
-        // scalar combine: 2 nibbles → 1 byte
-        byte[] tmp = new byte[SL];
-        paddedNibs.intoArray(tmp, 0);
-
+        // combine 2 nibbles → 1 byte
+        paddedNibs.intoArray(TMP, 0);
         int hexGroups = hasDot ? 6 : 8;
         int oi = 0;
-        for (int g = 0; g < hexGroups; g++) {
-            int b0 = tmp[g * 4] & 0xff;
-            int b1 = tmp[g * 4 + 1] & 0xff;
-            int b2 = tmp[g * 4 + 2] & 0xff;
-            int b3 = tmp[g * 4 + 3] & 0xff;
-            out[oi++] = (byte)((b0 << 4) | b1);
-            out[oi++] = (byte)((b2 << 4) | b3);
+        int ti = 0;
+        for (int g = 0; g < hexGroups; g++, ti += 4) {
+            out[oi++] = (byte)(((TMP[ti] & 0xFF) << 4) | (TMP[ti + 1] & 0xFF));
+            out[oi++] = (byte)(((TMP[ti + 2] & 0xFF) << 4) | (TMP[ti + 3] & 0xFF));
         }
         return true;
     }
