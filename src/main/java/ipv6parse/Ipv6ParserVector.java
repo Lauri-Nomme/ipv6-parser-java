@@ -118,13 +118,8 @@ public class Ipv6ParserVector {
                     ByteVector hexNibs = r.compress(keep);
                     ByteVector evens = hexNibs.rearrange(SHUFFLE_EVEN);
                     ByteVector odds  = hexNibs.rearrange(SHUFFLE_ODD);
-                    ByteVector result = evens.mul((byte) 16).or(odds);
-                    LongVector rlv = (LongVector) result.reinterpretAsLongs();
-                    long ol0 = rlv.lane(0), ol1 = rlv.lane(1);
-                    for (int i = 0; i < 8; i++) {
-                        out[i] = (byte)(ol0 >> (i * 8));
-                        out[i + 8] = (byte)(ol1 >> (i * 8));
-                    }
+                    ByteVector paired = evens.mul((byte) 16).or(odds);
+                    paired.intoArray(out, 0, SPECIES.indexInRange(0, 16));
                     return out;
                 }
             }
