@@ -55,25 +55,16 @@ public class Ipv6ParserVector {
         boolean hasDot = dotBits != 0;
         int dotCount = Long.bitCount(dotBits);
 
-        // ---- Phase 2: build segment boundaries -----------------------
+        // ---- Phase 2: detect empty segments & validate ----------------
         int segs = nc + 1;
-        int[] segStart = new int[segs];
-        int[] segEnd   = new int[segs];
-        segStart[0] = 0;
-        for (int i = 0; i < nc; i++) {
-            segEnd[i] = col[i];
-            segStart[i + 1] = col[i] + 1;
-        }
-        segEnd[nc] = len;
-
-        // ---- Phase 3: detect empty segments (::) ---------------------
         int emptyCount = 0;
         int firstEmpty = -1;
-        boolean emptiesConsecutive = true;
         int lastEmptyIdx = -2;
-        for (int i = 0; i < segs; i++) {
-            boolean e = segStart[i] == segEnd[i];
-            if (e) {
+        boolean emptiesConsecutive = true;
+        for (int i = 0; i <= nc; i++) {
+            int start = i == 0 ? 0 : col[i - 1] + 1;
+            int end = i == nc ? len : col[i];
+            if (start == end) {
                 emptyCount++;
                 if (firstEmpty < 0) firstEmpty = i;
                 if (lastEmptyIdx >= 0 && i != lastEmptyIdx + 1)
@@ -84,7 +75,6 @@ public class Ipv6ParserVector {
         if (emptyCount > 0 && !emptiesConsecutive) return null;
         if (ccPairs == 1 && (emptyCount < 1 || emptyCount > 3)) return null;
 
-        // ---- Phase 4: validate group counts --------------------------
         int hexGroups = hasDot ? 6 : 8;
         int hexSegs   = segs - (hasDot ? 1 : 0) - emptyCount;
         int pad = hexGroups - hexSegs;
@@ -120,7 +110,9 @@ public class Ipv6ParserVector {
             if (emptyCount == 0 && !hasDot) {
                 // Hot path: all hex segments, no ::, no IPv4
                 for (int i = 0; i < segs; i++) {
-                    int start = segStart[i], span = segEnd[i] - start;
+                    int start = i == 0 ? 0 : col[i - 1] + 1;
+                    int end = i == nc ? len : col[i];
+                    int span = end - start;
                     if (span < 1 || span > 4) return null;
                     int li = start / 8, bo = (start % 8) * 8;
                     long chunk = switch (li) {
@@ -146,7 +138,9 @@ public class Ipv6ParserVector {
             int oi = 0;
             boolean ddInserted = false;
             for (int i = 0; i < segs; i++) {
-                boolean isEmpty = segStart[i] == segEnd[i];
+                int start = i == 0 ? 0 : col[i - 1] + 1;
+                int end = i == nc ? len : col[i];
+                boolean isEmpty = start == end;
                 boolean isLast  = i == segs - 1;
                 boolean isHex   = !isLast || !hasDot;
 
@@ -156,7 +150,7 @@ public class Ipv6ParserVector {
                         ddInserted = true;
                     }
                 } else if (isHex) {
-                    int start = segStart[i], span = segEnd[i] - start;
+                    int span = end - start;
                     int li = start / 8, bo = (start % 8) * 8;
                     long chunk = switch (li) {
                         case 0 -> n0; case 1 -> n1; case 2 -> n2;
@@ -175,7 +169,7 @@ public class Ipv6ParserVector {
                     out[oi++] = (byte)hexVal;
                 } else {
                     if (dotCount != 3) return null;
-                    ipv4Suffix(input, off + segStart[i], segEnd[i] - segStart[i], out, oi);
+                    ipv4Suffix(input, off + start, end - start, out, oi);
                     oi += 4;
                 }
             }
@@ -185,7 +179,9 @@ public class Ipv6ParserVector {
             int oi = 0;
             boolean ddInserted = false;
             for (int i = 0; i < segs; i++) {
-                boolean isEmpty = segStart[i] == segEnd[i];
+                int start = i == 0 ? 0 : col[i - 1] + 1;
+                int end = i == nc ? len : col[i];
+                boolean isEmpty = start == end;
                 boolean isLast  = i == segs - 1;
                 boolean isHex   = !isLast || !hasDot;
 
@@ -195,14 +191,14 @@ public class Ipv6ParserVector {
                         ddInserted = true;
                     }
                 } else if (isHex) {
-                    int start = segStart[i], span = segEnd[i] - start;
+                    int span = end - start;
                     int v = 0;
                     for (int j = 0; j < span; j++) v = (v << 4) | (HEX_BUF[start + j] & 0xFF);
                     out[oi++] = (byte)(v >> 8);
                     out[oi++] = (byte)v;
                 } else {
                     if (dotCount != 3) return null;
-                    ipv4Suffix(input, off + segStart[i], segEnd[i] - segStart[i], out, oi);
+                    ipv4Suffix(input, off + start, end - start, out, oi);
                     oi += 4;
                 }
             }

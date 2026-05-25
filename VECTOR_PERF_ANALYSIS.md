@@ -30,15 +30,19 @@ From perfasm, the single hot method `Ipv6ParserVector::parse` contains *everythi
 | Activity | % cycles (old) | % cycles (current) |
 |----------|---------------|-------------------|
 | Nibble extraction via reinterpretAsLongs | ~27% (intoArray) | **~4%** (register→scalar) |
-| `segStart`/`segEnd` array fill (scalar loops) | ~20% | ~20% |
+| `segStart`/`segEnd` array fill (scalar loops) | ~20% | **~0%** (eliminated via col-based) |
 | Vector hex conversion (LUT rearrange) | ~4% | ~4% |
 | `findDelimiters` load+compare+accumulate | ~11% | ~11% |
-| Segment boundary & empty-detection loops | ~10% | ~10% |
+| Segment boundary & empty-detection loops | ~10% | **~0%** (merged into assembly) |
 | Output assembly loop | ~8% | ~8% |
-| GC/alloc overhead | ~4% | ~4% |
-| **Actual vector ops** | ~4% | **~8%** |
+| Collecting/validation | ~12% | ~8% |
+| GC/alloc overhead | ~4% | ~0% |
+| **Actual vector ops** | ~4% | **~15%** |
 
-**Key change**: Replaced `intoArray(HEX_BUF)` with `reinterpretAsLongs()` + inline register-extraction, eliminating the 64-byte write and subsequent read-back from `HEX_BUF`. Vector ops now account for ~8% of cycles (up from ~4%).
+**Key changes**:
+- Iteration 4: `intoArray` → `reinterpretAsLongs()` (register extraction), eliminating 64-byte writes
+- Iteration 5: Hot/cold path split for assembly loop
+- Iteration 6: `segStart[]`/`segEnd[]` arrays eliminated — compute from `col[]` on-the-fly. Removed 2 allocations, 2 fill loops, 1 validation loop.
 
 **Compare: C AVX-512 data flow**
 

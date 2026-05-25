@@ -68,27 +68,16 @@ public class Ipv6ParserVectorCE {
         boolean hasDot = dotBits != 0;
         int dotCount = Long.bitCount(dotBits);
 
-        // ---------- Phase 2: segment boundaries ----------
+        // ---------- Phase 2: empty segments & validate ----------
         int segs = nc + 1;
-        int[] segStart = new int[segs];
-        int[] segEnd   = new int[segs];
-        segStart[0] = 0;
-        for (int i = 0; i < nc; i++) {
-            segEnd[i] = col[i];
-            segStart[i + 1] = col[i] + 1;
-        }
-        segEnd[nc] = len;
-
-        // empty segments (::)
         int emptyCount = 0;
-        int firstEmpty = -1;
         boolean consec = true;
         int lastEmptyIdx = -2;
-        for (int i = 0; i < segs; i++) {
-            boolean e = segStart[i] == segEnd[i];
-            if (e) {
+        for (int i = 0; i <= nc; i++) {
+            int start = i == 0 ? 0 : col[i - 1] + 1;
+            int end = i == nc ? len : col[i];
+            if (start == end) {
                 emptyCount++;
-                if (firstEmpty < 0) firstEmpty = i;
                 if (lastEmptyIdx >= 0 && i != lastEmptyIdx + 1) consec = false;
                 lastEmptyIdx = i;
             }
@@ -103,34 +92,25 @@ public class Ipv6ParserVectorCE {
         if (emptyCount > 0 && pad < 1) return null;
         if (emptyCount == 0 && pad != 0) return null;
 
-        // validate hex segment sizes
-        int hexCharCount = 0;
-        for (int i = 0; i < segs; i++) {
-            boolean isLast = i == segs - 1;
-            boolean isHex  = !isLast || !hasDot;
-            if (segStart[i] < segEnd[i] && isHex) {
-                int span = segEnd[i] - segStart[i];
-                if (span < 1 || span > 4) return null;
-                hexCharCount += span;
-            }
-        }
-
         // ---------- Phase 3: build output group-sizes array ----------
         int[] grpSizes = new int[hexGroups];
         int gi = 0;
         boolean padDone = false;
         for (int si = 0; si < segs; si++) {
+            int start = si == 0 ? 0 : col[si - 1] + 1;
+            int end = si == nc ? len : col[si];
             boolean isLast = si == segs - 1;
             boolean isHex  = !isLast || !hasDot;
-            boolean empty  = segStart[si] == segEnd[si];
+            boolean empty  = start == end;
 
             if (empty && isHex && !padDone) {
-                // insert :: padding here (first empty segment triggers it)
                 for (int p = 0; p < pad; p++) grpSizes[gi++] = 0;
                 padDone = true;
             } else if (!empty && isHex) {
-                grpSizes[gi++] = segEnd[si] - segStart[si];
-            } // else IPv4 suffix — handled later
+                int span = end - start;
+                if (span < 1 || span > 4) return null;
+                grpSizes[gi++] = span;
+            }
         }
 
         // ---------- Phase 4: compress + hex-convert (or fallback) ----
