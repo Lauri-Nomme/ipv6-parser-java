@@ -10,39 +10,38 @@ Blog (2026-05-23) on **Xeon Gold 6548N @ 2.8 GHz** with GCC `-O3`:
 | AVX-512 | **71.3** | **120** | **2.45** |
 | Speedup | **12.5×** | 7.9× fewer | |
 
-Our Java on **i9-11950H @ 2.6 GHz** (also Ice Lake, 64-byte vectors) — **current**:
+Our Java on **i9-11950H @ 2.6 GHz** (also Ice Lake, 64-byte vectors) -- **current**:
 
 | Parser | 39-byte M/s | vs Scalar | vs C |
 |--------|------------|-----------|------|
-| Scalar | 7.5 | 1× | 0.11× |
-| SWAR | 6.1 | 0.81× | 0.09× |
-| SWAROpt | 9.0 | 1.20× | 0.13× |
-| VectorCE | 12.3 | 1.64× | 0.17× |
-| **Vector** | **28.9** | **3.85×** | **0.41×** |
-| C AVX-512 | 71.3 | ~9.5× | 1× |
+| Scalar | 8.1 | 1x | 0.11x |
+| SWAR | 5.7 | 0.70x | 0.08x |
+| SWAROpt | 8.4 | 1.04x | 0.12x |
+| VectorCE | 12.3 | 1.52x | 0.17x |
+| **Vector** | **39.3** | **4.85x** | **0.55x** |
+| C AVX-512 | 71.3 | ~8.8x | 1x |
 
-**Vector now reaches 41% of C throughput** (up from 9% baseline). The remaining gap: C does the entire pipeline in ~11 vector + 40 scalar instructions (120 total), while Java still needs ~300+ instructions for the same work.
+**Vector now reaches 55% of C throughput** (up from 9% baseline). The remaining gap: C does the entire pipeline in ~11 vector + 40 scalar instructions (120 total), while Java still needs ~200+ instructions for the same work.
 
 ---
 
-## Current Hot Profile (compress+pair approach)
+## Current Hot Profile (Iteration 8 -- compress+pair, masked store)
 
 From perfasm on `2001:0db8:85a3:0000:0000:8a2e:0370:7334` (39 bytes):
 
 | Activity | % cycles | Instruction |
 |----------|----------|-------------|
-| `Long.bitCount(hexBits)` | ~26% | `popcnt` |
-| Colon position loop + validation | ~18% | `tzcnt` + `blsr` + array stores |
-| `VectorMask.fromLong` (compress) | ~11% | mask creation |
-| `indexInRange` + `fromArray` (load) | ~7% | vector load |
-| LUT `rearrange` (hex convert) | ~5% | `vpermb` |
-| `compare` + `blend` + `sub` | ~4% | hi-byte shift |
-| `compress` + 2× `rearrange` + `mul` + `or` | ~10% | pairing pipeline |
-| `reinterpretAsLongs` + 2 lane extracts | ~3% | output extraction |
-| Empty segment detection | ~6% | `col[]` scan |
-| Other (branch, alloc, return) | ~10% | misc |
+| Compress + 2x rearrange + mul + or (pairing) | ~22% | `vpcompressb` + 2 `vpermb` + `vpmullb` + `vpor` |
+| Colon position extraction (while bit loop) | ~18% | `tzcnt` + `blsr` + array stores |
+| `VectorMask.fromLong` (compress mask) | ~12% | `kmovq` |
+| `indexInRange` + `fromArray` (load) | ~8% | vector load |
+| LUT `rearrange` (hex conversion) | ~6% | `vpermb` |
+| `compare` + `blend` + `sub` (hi-byte shift) | ~5% | hi-byte correction |
+| `len - nc == 32` check | ~4% | `sub` + `cmp` |
+| Masked `intoArray` (output store) | ~3% | `vmovdqu8` with mask |
+| Other (branch, alloc, return) | ~22% | misc |
 
-**Key change**: The lane-extraction bottleneck (~50% of cycles, 5× `lv.lane()`) is **eliminated**. The compress+pair approach replaces 5 slow lane extractions + scalar bit-op loop with: 1 compress + 2 constant shuffles + 1 mul + 1 or + 2 lane extracts.
+**Key changes from Iteration 7**: `Long.bitCount` (popcnt, ~26%) eliminated via `len - nc` substitution. The scalar `for` loop extracting 2 longs + 16 byte stores replaced with single masked `intoArray` (3% vs ~10%). Phase 2 empty detection loop skipped when `ccPairs == 0`, saving ~6% on full-form inputs.
 
 ---
 
@@ -123,7 +122,7 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 
 ## Improvement Ideas (Updated)
 
-### ✅ Implemented in Iterations 3-7
+### ✅ Implemented in Iterations 3-8
 
 | Idea | Iteration | Impact |
 |------|-----------|--------|
@@ -132,49 +131,51 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 | Hot/cold assembly path split | 5 | +11-13% (long input) |
 | Col-based segment bounds (kill arrays) | 6 | +7-13% |
 | **Compress+pair vector assembly** | **7** | **+82% (39-byte)** |
+| Popcnt elimination (len - nc instead) | 8 | minor (part of +40%) |
+| Skip empty detection when ccPairs == 0 | 8 | minor (part of +40%) |
+| **Masked vector store instead of lane extraction** | **8** | **+12% (39-byte)** |
 
 ### 🎯 High priority
 
-**1. Cache nonDelim bitmask** — the `(~delims) & ((1L << len) - 1)` value is computed twice (once for validation, once for compress). Compute once, reuse.
+**1. Multi-vector compress+pair fallback** -- For AVX2 (32-byte vectors), 39-byte inputs need 2 vectors. Extend compress+pair to handle the 2-vector case.
 
-**2. Skip empty detection for fast path** — the `emptyCount` scan over `col[]` is wasted when `ccPairs == 0`. Move it behind the `if (ccPairs == 1)` guard.
-
-**3. Remove hexGroups*4 check overhead** — the `if (hexChars == hexGroups * 4)` branch determines whether the compress path is taken. For 39-byte inputs this is always true, but the branch check + popcnt adds ~30% overhead. Could use a simpler heuristic: `(len - nc - 1) == hexGroups * 4` which avoids the popcnt.
+**2. Perfasm re-analysis** -- After each iteration, re-profile to identify the new top bottleneck.
 
 ### 🎯 Medium priority
 
-**4. Multi-vector compress+pair fallback** — For AVX2 (32-byte vectors, SL=32), 39-byte inputs need 2 vectors. The multi-vector fallback currently uses `HEX_BUF`. Extend compress+pair to handle the 2-vector case.
+**3. VectorCE compress+pair** -- The `compressExpandPath` already uses `compress`. Replace its `intoArray(TMP)` + scalar loop with the pairing approach.
 
-**5. VectorCE compress+pair** — The `compressExpandPath` already uses `compress`. Replace its `intoArray(TMP)` + scalar loop with the pairing approach. Could also eliminate the `grpSizes[]` allocation.
+**4. Skip validation checks on fast path** -- The `len - nc` and validation checks at lines 109-115 are always true on the compress+pair path. Could restructure to avoid the branch.
 
-**6. Perfasm re-analysis** — After each iteration, re-profile to identify the new top bottleneck.
+**5. Colon extraction via Long.compress** -- Instead of the `tzcnt` + `blsr` while-loop, use Long.compress to pack colon positions into contiguous lanes.
 
 ### 🎯 Low priority / speculative
 
-**7. Static shuffle from Long.compress** — Instead of `VectorMask.fromLong` + `compress`, use `Long.compress(posBits, colonBits)` to get packed colon positions, then compute segment spans via subtraction. This avoids the vector mask creation overhead entirely.
+**6. Stack-allocated scratch arrays** -- Escape analysis may already eliminate `col[8]` and `out[16]` allocations.
 
-**8. Stack-allocated scratch arrays** — Escape analysis may already eliminate `col[8]` and `out[16]` allocations. Verify with `-XX:+PrintEscapeAnalysis`.
+**7. vpmaddubsw for pairing** -- Instead of `mul` + `or`, use multiply-add semantics via `vpmaddubsw` + `vpackuswb`.
 
 ---
 
-## Update the 13× instruction gap
+## Update the 13x instruction gap
 
 | Component | C AVX-512 | Java Vector (current) | Factor |
 |-----------|-----------|----------------------|--------|
-| Hex conversion | 1 (`vpermb`) | 5 ops (sub+compare+blend+toShuffle+rearrange) | 5× |
-| Validation | 1 (`vpmovb2m`) | 5 ops (compare+toLong+bitwise) | 5× |
-| Group size computation | ~5 vector + 8 scalar | 1 scalar loop + `tzcnt` | ~6× |
-| **Hex→byte combine** | 2 (`maddubs`+`cvtepi16`) | **5 ops (compress+2 rearranges+mul+or)** | **2.5×** |
-| Memory alloc/free | 0 | 2 arrays (`col[8]`, `out[16]`) | — |
-| Overall instructions | ~120 | ~300 | **2.5×** |
+| Hex conversion | 1 (`vpermb`) | 5 ops (sub+compare+blend+toShuffle+rearrange) | 5x |
+| Validation | 1 (`vpmovb2m`) | 5 ops (compare+toLong+bitwise) | 5x |
+| Group size computation | ~5 vector + 8 scalar | 1 scalar loop + `tzcnt` | ~6x |
+| **Hex->byte combine** | 2 (`maddubs`+`cvtepi16`) | **5 ops (compress+2 rearranges+mul+or)** | **2.5x** |
+| **Output write** | 1 (`vmovdqu8`) | **1 (`vmovdqu8` with mask)** | **1x** |
+| Memory alloc/free | 0 | 2 arrays (`col[8]`, `out[16]`) | -- |
+| Overall instructions | ~120 | ~200 | **1.7x** |
 
-The gap has narrowed from **13× to 2.5×** — a 5× improvement through Iterations 3-7.
+The gap has narrowed from **13x to 1.7x** -- a 7.6x improvement through Iterations 3-8.
 
 ---
 
 ## C Comparison: Remaining Gap
 
-The C code does the full 39-byte parse in ~120 instructions. Our Java Vector now takes ~300 instructions (estimated from the halving of cycles from Iteration 6 → 7).
+The C code does the full 39-byte parse in ~120 instructions. Our Java Vector now takes ~200 instructions (estimated from Iteration 8's 40% throughput gain over Iteration 7).
 
 C's advantages that Java cannot eliminate:
 1. **Register allocation**: C has 32 vector registers (zmm0-zmm31) and 16 GP registers — all managed by the compiler. Java's C2 has the same but must also handle object references and safepoints.

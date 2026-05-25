@@ -268,7 +268,9 @@ Same JDK and JMH config:
 | `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | **28,122,987** | 11,743,336 |
 | `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | **28,128,279** | 11,686,738 |
 
-*Iteration 7: Vector compress+pair assembly for the all-span-4 fast path (common 39-byte full-form). Replaces 5 long lane extractions + scalar bit-op loop (was ~50% of cycles) with 5 vector ops (compress + 2 rearranges + mul + or). 39-byte throughput nearly doubled: 15.7 → 28.1 M/s (**+79%**). Achieves **3.71× vs scalar** on long inputs. Short/cold-path inputs unchanged.*
+*Iteration 8: Three optimizations for the compress+pair fast path. (1) Replace `Long.bitCount` popcnt with `len - nc` subtraction. (2) Skip Phase 2 empty detection loop when `ccPairs == 0`. (3) Replace lane extraction + byte loop with single masked `intoArray` (`vmovdqu8`). 39-byte throughput: 28.1 -> 39.3 M/s (**+40%**). Achieves **4.85x vs scalar** and reaches **55% of C AVX-512 throughput**. Short inputs unchanged.*
+
+*Iteration 7: Vector compress+pair assembly for the all-span-4 fast path (common 39-byte full-form). Replaces 5 long lane extractions + scalar bit-op loop (was ~50% of cycles) with 5 vector ops (compress + 2 rearranges + mul + or). 39-byte throughput nearly doubled: 15.7 -> 28.1 M/s (**+79%**). Achieves **3.71x vs scalar** on long inputs. Short/cold-path inputs unchanged.*
 
 *Iteration 5: Split assembly loop into fast-path (all-hex, no `::`, no IPv4) and cold path — eliminates `isEmpty`/`isHex` branches from the hot loop. Long inputs improved +11–13% over iteration 4; short inputs unchanged.*
 
@@ -324,10 +326,10 @@ Five changes drove the improvement:
 **Full ranking (AVX-512, throughput)**:
 
 | Input | 1st | 2nd | 3rd | 4th | 5th |
-|---|---|---|---|---|---|
-| Short (3–11) | **Vector 1.15–1.25×** | Scalar 1× | VectorCE 0.65–0.92× | SWAROpt 0.68–0.73× | SWAR 0.57× |
-| Medium (19–22) | **Vector 1.18–1.72×** | VectorCE 0.97–1.20× | SWAROpt 1.02× | Scalar 1× | SWAR 0.80× |
-| Long (39) | **Vector 3.71×** | VectorCE 1.51× | SWAROpt 1.16× | Scalar 1× | SWAR 0.81× |
+|---|---|---|---|---|---|---|
+| Short (3-11) | **Vector 1.15-1.25x** | Scalar 1x | VectorCE 0.65-0.92x | SWAROpt 0.68-0.73x | SWAR 0.57x |
+| Medium (19-22) | **Vector 1.18-1.72x** | VectorCE 0.97-1.20x | SWAROpt 1.02x | Scalar 1x | SWAR 0.80x |
+| **Long (39)** | **Vector 4.85x** | VectorCE 1.52x | SWAROpt 1.04x | Scalar 1x | SWAR 0.70x |
 
 
 *Rankings updated after LUT-based hex conversion. Vector and VectorCE improved significantly on long inputs (from ~1.35× to ~1.58× and ~1.50× vs scalar respectively).*
