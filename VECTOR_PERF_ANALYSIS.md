@@ -14,34 +14,33 @@ Our Java on **i9-11950H @ 2.6 GHz** (also Ice Lake, 64-byte vectors) -- **curren
 
 | Parser | 39-byte M/s | vs Scalar | vs C |
 |--------|------------|-----------|------|
-| Scalar | 8.1 | 1x | 0.11x |
-| SWAR | 5.7 | 0.70x | 0.08x |
-| SWAROpt | 8.4 | 1.04x | 0.12x |
-| VectorCE | 12.3 | 1.52x | 0.17x |
-| **Vector** | **39.3** | **4.85x** | **0.55x** |
-| C AVX-512 | 71.3 | ~8.8x | 1x |
+| Scalar | 8.5 | 1x | 0.12x |
+| SWAR | 5.7 | 0.67x | 0.08x |
+| SWAROpt | 8.4 | 0.99x | 0.12x |
+| VectorCE | 11.0 | 1.29x | 0.15x |
+| **Vector** | **50.2** | **5.91x** | **0.70x** |
+| C AVX-512 | 71.3 | ~8.4x | 1x |
 
-**Vector now reaches 55% of C throughput** (up from 9% baseline). The remaining gap: C does the entire pipeline in ~11 vector + 40 scalar instructions (120 total), while Java still needs ~200+ instructions for the same work.
+**Vector now reaches 70% of C throughput** (up from 9% baseline). The remaining gap: C does the entire pipeline in ~120 instructions, while Java needs ~150+ instructions for the same work.
 
 ---
 
-## Current Hot Profile (Iteration 8 -- compress+pair, masked store)
+## Current Hot Profile (Iteration 9 -- deferred colon extraction)
 
 From perfasm on `2001:0db8:85a3:0000:0000:8a2e:0370:7334` (39 bytes):
 
 | Activity | % cycles | Instruction |
 |----------|----------|-------------|
-| Compress + 2x rearrange + mul + or (pairing) | ~22% | `vpcompressb` + 2 `vpermb` + `vpmullb` + `vpor` |
-| Colon position extraction (while bit loop) | ~18% | `tzcnt` + `blsr` + array stores |
-| `VectorMask.fromLong` (compress mask) | ~12% | `kmovq` |
-| `indexInRange` + `fromArray` (load) | ~8% | vector load |
-| LUT `rearrange` (hex conversion) | ~6% | `vpermb` |
-| `compare` + `blend` + `sub` (hi-byte shift) | ~5% | hi-byte correction |
-| `len - nc == 32` check | ~4% | `sub` + `cmp` |
-| Masked `intoArray` (output store) | ~3% | `vmovdqu8` with mask |
-| Other (branch, alloc, return) | ~22% | misc |
+| Compress + 2x rearrange + mul + or (pairing) | ~30% | `vpcompressb` + 2 `vpermb` + `vpmullb` + `vpor` |
+| `VectorMask.fromLong` (compress mask) | ~15% | `kmovq` |
+| `indexInRange` + `fromArray` (load) | ~10% | vector load |
+| LUT `rearrange` (hex conversion) | ~8% | `vpermb` |
+| `compare` + `blend` + `sub` (hi-byte shift) | ~7% | hi-byte correction |
+| Colon extraction + `len - nc == 32` check | ~5% | bitmask popcnt + sub |
+| Masked `intoArray` (output store) | ~4% | `vmovdqu8` with mask |
+| Other (branch, alloc, return) | ~21% | misc |
 
-**Key changes from Iteration 7**: `Long.bitCount` (popcnt, ~26%) eliminated via `len - nc` substitution. The scalar `for` loop extracting 2 longs + 16 byte stores replaced with single masked `intoArray` (3% vs ~10%). Phase 2 empty detection loop skipped when `ccPairs == 0`, saving ~6% on full-form inputs.
+**Key change from Iteration 8**: The colon position extraction while-loop (~18%) is completely eliminated from the compress+pair fast path. `nc` and `ccPairs` are now computed directly from the `colonBits` bitmask. The full `tzcnt` + `blsr` loop only runs for mixed-span or cold-path inputs.
 
 ---
 
@@ -122,7 +121,7 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 
 ## Improvement Ideas (Updated)
 
-### ✅ Implemented in Iterations 3-8
+### ✅ Implemented in Iterations 3-9
 
 | Idea | Iteration | Impact |
 |------|-----------|--------|
@@ -133,7 +132,8 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 | **Compress+pair vector assembly** | **7** | **+82% (39-byte)** |
 | Popcnt elimination (len - nc instead) | 8 | minor (part of +40%) |
 | Skip empty detection when ccPairs == 0 | 8 | minor (part of +40%) |
-| **Masked vector store instead of lane extraction** | **8** | **+12% (39-byte)** |
+| Masked vector store instead of lane extraction | 8 | +12% (39-byte) |
+| **Defer colon position extraction** | **9** | **+28% (39-byte)** |
 
 ### 🎯 High priority
 
@@ -147,7 +147,7 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 
 **4. Skip validation checks on fast path** -- The `len - nc` and validation checks at lines 109-115 are always true on the compress+pair path. Could restructure to avoid the branch.
 
-**5. Colon extraction via Long.compress** -- Instead of the `tzcnt` + `blsr` while-loop, use Long.compress to pack colon positions into contiguous lanes.
+**5. Multi-vector compress+pair fallback** -- For AVX2 (32-byte vectors), 39-byte inputs need 2 vectors. Extend compress+pair to handle the 2-vector case.
 
 ### 🎯 Low priority / speculative
 
@@ -163,19 +163,19 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 |-----------|-----------|----------------------|--------|
 | Hex conversion | 1 (`vpermb`) | 5 ops (sub+compare+blend+toShuffle+rearrange) | 5x |
 | Validation | 1 (`vpmovb2m`) | 5 ops (compare+toLong+bitwise) | 5x |
-| Group size computation | ~5 vector + 8 scalar | 1 scalar loop + `tzcnt` | ~6x |
+| Colon detection + counting | 1 (`vpcmpb`+`popcnt`) | 3 ops (compare+toLong+popcnt) | 3x |
 | **Hex->byte combine** | 2 (`maddubs`+`cvtepi16`) | **5 ops (compress+2 rearranges+mul+or)** | **2.5x** |
 | **Output write** | 1 (`vmovdqu8`) | **1 (`vmovdqu8` with mask)** | **1x** |
-| Memory alloc/free | 0 | 2 arrays (`col[8]`, `out[16]`) | -- |
-| Overall instructions | ~120 | ~200 | **1.7x** |
+| Memory alloc/free | 0 | 1 array (`out[16]`) | -- |
+| Overall instructions | ~120 | ~150 | **1.25x** |
 
-The gap has narrowed from **13x to 1.7x** -- a 7.6x improvement through Iterations 3-8.
+The gap has narrowed from **13x to 1.25x** -- a 10.4x improvement through Iterations 3-9.
 
 ---
 
 ## C Comparison: Remaining Gap
 
-The C code does the full 39-byte parse in ~120 instructions. Our Java Vector now takes ~200 instructions (estimated from Iteration 8's 40% throughput gain over Iteration 7).
+The C code does the full 39-byte parse in ~120 instructions. Our Java Vector now takes ~150 instructions (estimated from Iteration 9's 28% throughput gain over Iteration 8).
 
 C's advantages that Java cannot eliminate:
 1. **Register allocation**: C has 32 vector registers (zmm0-zmm31) and 16 GP registers — all managed by the compiler. Java's C2 has the same but must also handle object references and safepoints.
