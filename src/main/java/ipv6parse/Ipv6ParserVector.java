@@ -111,8 +111,8 @@ public class Ipv6ParserVector {
 
             if (emptyCount == 0 && !hasDot) {
                 // Hot path: all hex segments, no ::, no IPv4
-                int hexChars = Long.bitCount(nonDelim);
-                if (hexChars == hexGroups * 4) {
+                // len - nc = hex chars (no dots on this path), avoids popcnt
+                if (len - nc == hexGroups * 4) {
                     // All segments span exactly 4 chars — vector compress+pair
                     VectorMask<Byte> keep = VectorMask.fromLong(SPECIES, nonDelim);
                     ByteVector hexNibs = r.compress(keep);
