@@ -18,10 +18,10 @@ Our Java on **i9-11950H @ 2.6 GHz** (also Ice Lake, 64-byte vectors) -- **curren
 | SWAR | 5.7 | 0.72x | 0.08x |
 | SWAROpt | 8.4 | 1.06x | 0.12x |
 | VectorCE | 15.8 | 2.0x | 0.22x |
-| **Vector** | **49.5** | **6.27x** | **0.69x** |
+| **Vector** | **58.1** | **7.4x** | **0.81x** |
 | C AVX-512 | 71.3 | ~9.0x | 1x |
 
-**VectorCE compress+pair fast path (Iteration 10) lifted all-span-4 throughput from 11.0 to 15.8 M/s (+44%). Vector unchanged at 70% of C.**
+**Iteration 11b: Cold-path compress+expand+pair replaces per-segment scalar loop for `::`-without-IPv4 cases. `computeExpandMask` now handles empty segments (span=0 from `::`). Mixed-span path also uses compress+expand+pair (+29%). 39-byte Vector stable at 58.1 M/s.**
 
 ---
 
@@ -135,6 +135,8 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 | Masked vector store instead of lane extraction | 8 | +12% (39-byte) |
 | Defer colon position extraction | 9 | +28% (39-byte) |
 | **VectorCE compress+pair fast path** | **10** | **+44% (39-byte VectorCE)** |
+| **VectorCE TMP→shuffle+mul+or (non-all-span-4)** | **11a** | **~85 fewer instr** |
+| **Mixed-span & cold-path compress+expand+pair** | **11b** | **+29% mixed, +12% cold** |
 
 ### 🎯 High priority
 
@@ -144,17 +146,15 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 
 ### 🎯 Medium priority
 
-**3. VectorCE compress+pair** -- The `compressExpandPath` already uses `compress`. Replace its `intoArray(TMP)` + scalar loop with the pairing approach.
+**3. ::+IPv4 cold path** -- The IPv4 suffix (span > 4) still falls through to the per-segment loop at 17 M/s. SWAR decimal→binary parsing could replace the scalar loop.
 
-**4. Skip validation checks on fast path** -- The `len - nc` and validation checks at lines 109-115 are always true on the compress+pair path. Could restructure to avoid the branch.
-
-**5. Multi-vector compress+pair fallback** -- For AVX2 (32-byte vectors), 39-byte inputs need 2 vectors. Extend compress+pair to handle the 2-vector case.
+**4. Skip validation checks on fast path** -- The `len - nc` and validation checks are always true on the compress+pair path. Could restructure to avoid the branch.
 
 ### 🎯 Low priority / speculative
 
-**6. Stack-allocated scratch arrays** -- Escape analysis may already eliminate `col[8]` and `out[16]` allocations.
+**5. Stack-allocated scratch arrays** -- Escape analysis may already eliminate `col[8]` and `out[16]` allocations.
 
-**7. vpmaddubsw for pairing** -- Instead of `mul` + `or`, use multiply-add semantics via `vpmaddubsw` + `vpackuswb`.
+**6. vpmaddubsw for pairing** -- Instead of `mul` + `or`, use multiply-add semantics via `vpmaddubsw` + `vpackuswb`.
 
 ---
 

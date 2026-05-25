@@ -115,9 +115,21 @@ public class Ipv6ParserVector {
                     paired.intoArray(out, 0, SPECIES.indexInRange(0, 16));
                     return out;
                 }
+                // Mixed-span fast path: compress + expand(per-segment pad) + pair
+                // Replaces per-segment scalar extraction with vector compress+expand+pair
+                long expandBits = computeExpandMask(colonBits, len, nc, segs);
+                if (expandBits == -1L) return null; // invalid span
+                VectorMask<Byte> keep = VectorMask.fromLong(SPECIES, nonDelim);
+                ByteVector hexNibs = r.compress(keep);
+                ByteVector padded = hexNibs.expand(VectorMask.fromLong(SPECIES, expandBits));
+                ByteVector evens = padded.rearrange(SHUFFLE_EVEN);
+                ByteVector odds  = padded.rearrange(SHUFFLE_ODD);
+                ByteVector paired = evens.mul((byte) 16).or(odds);
+                paired.intoArray(out, 0, SPECIES.indexInRange(0, 16));
+                return out;
             }
 
-            // Extract longs from nibble vector (needed for mixed-span fast path and cold path)
+            // Extract longs from nibble vector (needed for cold path)
             LongVector lv = (LongVector) r.reinterpretAsLongs();
             int nLongs = (len + 7) / 8;
             long n0 = 0, n1 = 0, n2 = 0, n3 = 0, n4 = 0, n5 = 0;
@@ -128,37 +140,25 @@ public class Ipv6ParserVector {
             if (nLongs > 4) n4 = lv.lane(4);
             if (nLongs > 5) n5 = lv.lane(5);
 
-            // Fill colon positions if not done yet (for non-compress+pair paths)
+            // Cold path: handle :: or IPv4
+            // Use compress+expand+pair for :: without IPv4 (IPv4 suffix has
+            // span > 4, causing computeExpandMask to return -1L, falling through)
             if (ccPairs == 0) fillColonPositions(colonBits, col);
-
-            if (emptyCount == 0 && !hasDot) {
-                // Mixed-span fast path
-                for (int i = 0; i < segs; i++) {
-                    int start = i == 0 ? 0 : col[i - 1] + 1;
-                    int end = i == nc ? len : col[i];
-                    int span = end - start;
-                    if (span < 1 || span > 4) return null;
-                    int li = start / 8, bo = (start % 8) * 8;
-                    long chunk = switch (li) {
-                        case 0 -> n0; case 1 -> n1; case 2 -> n2;
-                        case 3 -> n3; case 4 -> n4; case 5 -> n5;
-                        default -> 0; } >>> bo;
-                    int hexVal;
-                    switch (span) {
-                        case 1 -> hexVal = (int)(chunk) & 0xFF;
-                        case 2 -> hexVal = ((int)(chunk) & 0xFF) << 4 | ((int)(chunk >>> 8) & 0xFF);
-                        case 3 -> hexVal = ((int)(chunk) & 0xFF) << 8 | ((int)(chunk >>> 8) & 0xFF) << 4 | ((int)(chunk >>> 16) & 0xFF);
-                        case 4 -> hexVal = ((int)(chunk) & 0xFF) << 12 | ((int)(chunk >>> 8) & 0xFF) << 8
-                                        | ((int)(chunk >>> 16) & 0xFF) << 4 | ((int)(chunk >>> 24) & 0xFF);
-                        default -> hexVal = 0;
-                    }
-                    out[i * 2] = (byte)(hexVal >> 8);
-                    out[i * 2 + 1] = (byte)hexVal;
+            if (emptyCount > 0 && !hasDot) {
+                long expandBits = computeExpandMask(colonBits, len, nc, segs);
+                if (expandBits != -1L) {
+                    VectorMask<Byte> keep = VectorMask.fromLong(SPECIES, nonDelim);
+                    ByteVector hexNibs = r.compress(keep);
+                    ByteVector padded = hexNibs.expand(VectorMask.fromLong(SPECIES, expandBits));
+                    ByteVector evens = padded.rearrange(SHUFFLE_EVEN);
+                    ByteVector odds  = padded.rearrange(SHUFFLE_ODD);
+                    ByteVector paired = evens.mul((byte) 16).or(odds);
+                    paired.intoArray(out, 0, SPECIES.indexInRange(0, 16));
+                    return out;
                 }
-                return out;
             }
 
-            // Cold path: handle :: or IPv4
+            // Fallback: per-segment loop (IPv4 suffix or unusual case)
             int oi = 0;
             boolean ddInserted = false;
             for (int i = 0; i < segs; i++) {
@@ -175,11 +175,23 @@ public class Ipv6ParserVector {
                     }
                 } else if (isHex) {
                     int span = end - start;
-                    int li = start / 8, bo = (start % 8) * 8;
-                    long chunk = switch (li) {
+                    if (span < 1 || span > 4) return null;
+                    int li = start / 8;
+                    int bo = start % 8;
+                    long lo = switch (li) {
                         case 0 -> n0; case 1 -> n1; case 2 -> n2;
                         case 3 -> n3; case 4 -> n4; case 5 -> n5;
-                        default -> 0; } >>> bo;
+                        default -> 0; };
+                    long chunk;
+                    if (bo == 0) {
+                        chunk = lo;
+                    } else {
+                        long hi = switch (li + 1) {
+                            case 0 -> n0; case 1 -> n1; case 2 -> n2;
+                            case 3 -> n3; case 4 -> n4; case 5 -> n5;
+                            default -> 0; };
+                        chunk = (hi << (64 - bo * 8)) | (lo >>> (bo * 8));
+                    }
                     int hexVal;
                     switch (span) {
                         case 1 -> hexVal = (int)(chunk) & 0xFF;
@@ -283,6 +295,35 @@ public class Ipv6ParserVector {
     // -----------------------------------------------------------------
     //  IPv4 suffix (scalar — tiny, not worth vectorizing)
     // -----------------------------------------------------------------
+
+    /** Build expand mask for all inputs (including :: empty segments).
+     *  Each segment gets 4 nibble-slot positions with right-aligned padding.
+     *  Empty segments (span=0) produce all zeros in their slot.
+     *  Returns -1L if any non-empty segment has an invalid span. */
+    private static long computeExpandMask(long colonBits, int len, int nc, int segs) {
+        long expandBits = 0;
+        int bitPos = 0;
+        int start = 0;
+        long bits = colonBits;
+        for (int i = 0; i < segs; i++) {
+            int end = i < nc ? Long.numberOfTrailingZeros(bits) : len;
+            int span = end - start;
+            if (span == 0) {
+                // empty segment from :: : just advance past its 4 nibble slots
+                bitPos += 4;
+                if (i < nc) bits &= bits - 1;
+                start = end + 1;
+                continue;
+            }
+            if (span < 1 || span > 4) return -1L;
+            int shift = 4 - span;
+            expandBits |= ((1L << span) - 1) << (bitPos + shift);
+            bitPos += 4;
+            if (i < nc) bits &= bits - 1;
+            start = end + 1;
+        }
+        return expandBits;
+    }
 
     private static void fillColonPositions(long bits, int[] col) {
         for (int i = 0; bits != 0; i++) {
