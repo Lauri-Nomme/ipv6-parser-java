@@ -268,7 +268,9 @@ Same JDK and JMH config:
 | `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | **28,122,987** | 11,743,336 |
 | `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | **28,128,279** | 11,686,738 |
 
-*Iteration 11b: Cold-path compress+expand+pair replaces per-segment scalar loop for `::`-without-IPv4 cases. `computeExpandMask` handles empty segments (span=0). Mixed-span path (e.g. `2001:db8:0:0:0:0:0:1`) also uses compress+expand+pair — 27.1 -> 35.0 M/s (**+29%**). Cold path `2001:db8::1`: 27.1 -> 30.4 M/s (**+12%**). `fe80::1`: 31.7 -> 35.4 M/s (**+12%**). 39-byte stable at 58.1 M/s. `::+IPv4` unchanged (falls through to per-segment loop).*
+*Iteration 12: Eliminate `VectorMask.fromLong(nonDelim)` — reuse `compare(GE, 0)` mask for both validation and compress. Saves one compare and one fromLong per path. 39-byte hot path: 58.1 -> 60.0 M/s (**+3%**). Reverted buggy cold-path compress+expand+pair (didn't handle `::` pad expansion).*
+
+*Iteration 11b: Cold-path compress+expand+pair for `::`-without-IPv4 (later reverted — pad bug). Mixed-span path also uses compress+expand+pair — 27.1 -> 35.0 M/s (**+29%**).*
 
 *Iteration 11a: Replace VectorCE's `intoArray(TMP)` + scalar loop with shuffle+mul+or pairing in the non-all-span-4 path. Removes 85 instructions from the ~1560 instruction body. VectorCE 39-byte fast path unchanged (already uses compress+pair from Iteration 10).*
 
@@ -337,7 +339,7 @@ Five changes drove the improvement:
 |----|---|---|---|---|---|---|
 | Short (3-11) | **Vector 1.15-1.25x** | Scalar 1x | VectorCE 0.65-0.92x | SWAROpt 0.68-0.73x | SWAR 0.57x |
 | Medium (19-22) | **Vector 1.85-2.85x** | VectorCE 0.97-1.20x | SWAROpt 1.02x | Scalar 1x | SWAR 0.80x |
-| **Long (39)** | **Vector 7.4x** | VectorCE 2.0x | SWAROpt 1.04x | Scalar 1x | SWAR 0.70x |
+| **Long (39)** | **Vector 7.6x** | VectorCE 2.0x | SWAROpt 1.04x | Scalar 1x | SWAR 0.70x |
 
 
 *Rankings updated after LUT-based hex conversion. Vector and VectorCE improved significantly on long inputs (from ~1.35× to ~1.58× and ~1.50× vs scalar respectively).*

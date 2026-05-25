@@ -89,7 +89,6 @@ public class Ipv6ParserVector {
         // ---- Phase 5+6: validate, convert & assemble output ----------
         byte[] out = new byte[16];
         long delims = colonBits | dotBits;
-        long nonDelim = (~delims) & ((1L << len) - 1);
 
         if (len <= SL) {
             // Single-vector fast path: keep nibbles in register longs
@@ -99,15 +98,14 @@ public class Ipv6ParserVector {
             ByteVector idx = v.blend(v.sub((byte) 64), isHi);
             ByteVector r = LUT.rearrange(idx.toShuffle());
 
-            long invalidBits = r.compare(VectorOperators.LT, (byte) 0).toLong();
-            if ((invalidBits & nonDelim) != 0) return null;
+            VectorMask<Byte> keep = r.compare(VectorOperators.GE, (byte) 0);
+            if (((~keep.toLong()) & ((1L << len) - 1)) != delims) return null;
 
             if (emptyCount == 0 && !hasDot) {
                 // Hot path: all hex segments, no ::, no IPv4
                 // len - nc = hex chars (no dots on this path), avoids popcnt
                 if (len - nc == hexGroups * 4) {
                     // All segments span exactly 4 chars — vector compress+pair
-                    VectorMask<Byte> keep = VectorMask.fromLong(SPECIES, nonDelim);
                     ByteVector hexNibs = r.compress(keep);
                     ByteVector evens = hexNibs.rearrange(SHUFFLE_EVEN);
                     ByteVector odds  = hexNibs.rearrange(SHUFFLE_ODD);
@@ -119,7 +117,6 @@ public class Ipv6ParserVector {
                 // Replaces per-segment scalar extraction with vector compress+expand+pair
                 long expandBits = computeExpandMask(colonBits, len, nc, segs);
                 if (expandBits == -1L) return null; // invalid span
-                VectorMask<Byte> keep = VectorMask.fromLong(SPECIES, nonDelim);
                 ByteVector hexNibs = r.compress(keep);
                 ByteVector padded = hexNibs.expand(VectorMask.fromLong(SPECIES, expandBits));
                 ByteVector evens = padded.rearrange(SHUFFLE_EVEN);
@@ -140,25 +137,10 @@ public class Ipv6ParserVector {
             if (nLongs > 4) n4 = lv.lane(4);
             if (nLongs > 5) n5 = lv.lane(5);
 
-            // Cold path: handle :: or IPv4
-            // Use compress+expand+pair for :: without IPv4 (IPv4 suffix has
-            // span > 4, causing computeExpandMask to return -1L, falling through)
+            // Fill colon positions for per-segment loop (IPv4 suffix or ::)
             if (ccPairs == 0) fillColonPositions(colonBits, col);
-            if (emptyCount > 0 && !hasDot) {
-                long expandBits = computeExpandMask(colonBits, len, nc, segs);
-                if (expandBits != -1L) {
-                    VectorMask<Byte> keep = VectorMask.fromLong(SPECIES, nonDelim);
-                    ByteVector hexNibs = r.compress(keep);
-                    ByteVector padded = hexNibs.expand(VectorMask.fromLong(SPECIES, expandBits));
-                    ByteVector evens = padded.rearrange(SHUFFLE_EVEN);
-                    ByteVector odds  = padded.rearrange(SHUFFLE_ODD);
-                    ByteVector paired = evens.mul((byte) 16).or(odds);
-                    paired.intoArray(out, 0, SPECIES.indexInRange(0, 16));
-                    return out;
-                }
-            }
 
-            // Fallback: per-segment loop (IPv4 suffix or unusual case)
+            // Fallback: per-segment loop (IPv4 suffix or :: with pad)
             int oi = 0;
             boolean ddInserted = false;
             for (int i = 0; i < segs; i++) {

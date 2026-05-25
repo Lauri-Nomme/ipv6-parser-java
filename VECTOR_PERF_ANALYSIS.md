@@ -18,10 +18,10 @@ Our Java on **i9-11950H @ 2.6 GHz** (also Ice Lake, 64-byte vectors) -- **curren
 | SWAR | 5.7 | 0.72x | 0.08x |
 | SWAROpt | 8.4 | 1.06x | 0.12x |
 | VectorCE | 15.8 | 2.0x | 0.22x |
-| **Vector** | **58.1** | **7.4x** | **0.81x** |
+| **Vector** | **60.0** | **7.6x** | **0.84x** |
 | C AVX-512 | 71.3 | ~9.0x | 1x |
 
-**Iteration 11b: Cold-path compress+expand+pair replaces per-segment scalar loop for `::`-without-IPv4 cases. `computeExpandMask` now handles empty segments (span=0 from `::`). Mixed-span path also uses compress+expand+pair (+29%). 39-byte Vector stable at 58.1 M/s.**
+**Iteration 12: Eliminate `VectorMask.fromLong(nonDelim)` — reuse `compare(GE, 0)` mask from validation for compress, saving one compare + one fromLong per path. +3% on hot path (58.1→60.0 M/s). Removed buggy cold-path compress+expand+pair (didn't handle `::` pad expansion).**
 
 ---
 
@@ -136,7 +136,8 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 | Defer colon position extraction | 9 | +28% (39-byte) |
 | **VectorCE compress+pair fast path** | **10** | **+44% (39-byte VectorCE)** |
 | **VectorCE TMP→shuffle+mul+or (non-all-span-4)** | **11a** | **~85 fewer instr** |
-| **Mixed-span & cold-path compress+expand+pair** | **11b** | **+29% mixed, +12% cold** |
+| **Mixed-span & cold-path compress+expand+pair** | **11b** | **+29% mixed** |
+| **Eliminate fromLong(nonDelim), reuse compare mask** | **12** | **+3% hot path** |
 
 ### 🎯 High priority
 
