@@ -69,21 +69,21 @@ public class Ipv6ParserVector {
         // ---- Phase 2: detect empty segments & validate ----------------
         int segs = nc + 1;
         int emptyCount = 0;
-        int firstEmpty = -1;
-        int lastEmptyIdx = -2;
         boolean emptiesConsecutive = true;
-        for (int i = 0; i <= nc; i++) {
-            int start = i == 0 ? 0 : col[i - 1] + 1;
-            int end = i == nc ? len : col[i];
-            if (start == end) {
-                emptyCount++;
-                if (firstEmpty < 0) firstEmpty = i;
-                if (lastEmptyIdx >= 0 && i != lastEmptyIdx + 1)
-                    emptiesConsecutive = false;
-                lastEmptyIdx = i;
+        if (ccPairs > 0) {
+            int lastEmptyIdx = -2;
+            for (int i = 0; i <= nc; i++) {
+                int start = i == 0 ? 0 : col[i - 1] + 1;
+                int end = i == nc ? len : col[i];
+                if (start == end) {
+                    emptyCount++;
+                    if (lastEmptyIdx >= 0 && i != lastEmptyIdx + 1)
+                        emptiesConsecutive = false;
+                    lastEmptyIdx = i;
+                }
             }
+            if (!emptiesConsecutive) return null;
         }
-        if (emptyCount > 0 && !emptiesConsecutive) return null;
         if (ccPairs == 1 && (emptyCount < 1 || emptyCount > 3)) return null;
 
         int hexGroups = hasDot ? 6 : 8;
