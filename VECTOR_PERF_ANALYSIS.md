@@ -1,4 +1,4 @@
-# Why Vector & VectorCE Are Not 10x Faster
+# Why Vector & VectorCE Are Not 10x Faster (Updated)
 
 ## Baseline: Lemire's C AVX-512
 
@@ -10,320 +10,179 @@ Blog (2026-05-23) on **Xeon Gold 6548N @ 2.8 GHz** with GCC `-O3`:
 | AVX-512 | **71.3** | **120** | **2.45** |
 | Speedup | **12.5×** | 7.9× fewer | |
 
-Our Java on **i9-11950H @ 2.6 GHz** (also Ice Lake, also 64-byte vectors):
+Our Java on **i9-11950H @ 2.6 GHz** (also Ice Lake, 64-byte vectors) — **current**:
 
-| Parser | M/s | instr/op | IPC |
-|--------|-----|----------|-----|
-| Scalar | 9.08 | 2,775 | 5.37 |
-| Vector | 11.65 | 1,956 | 4.83 |
-| VectorCE | 13.79 | 1,578 | 4.41 |
-| Best speedup | **1.5×** | — | — |
+| Parser | 39-byte M/s | vs Scalar | vs C |
+|--------|------------|-----------|------|
+| Scalar | 7.5 | 1× | 0.11× |
+| SWAR | 6.1 | 0.81× | 0.09× |
+| SWAROpt | 9.0 | 1.20× | 0.13× |
+| VectorCE | 12.3 | 1.64× | 0.17× |
+| **Vector** | **28.9** | **3.85×** | **0.41×** |
+| C AVX-512 | 71.3 | ~9.5× | 1× |
 
-**The headline gap: C AVX-512 = 120 instructions/parse; Java VectorCE = 1,578 instructions/op.** That's 13× more instructions for the same logical algorithm. The gap is not in the vector hardware — it's in how much *scalar scaffolding* surrounds each vector operation.
-
----
-
-## Root Cause 1: Only 20% of instructions are vector ops
-
-From perfasm, the single hot method `Ipv6ParserVector::parse` contains *everything* — inlined. C2 compiles it as one giant method (version 4, ~800+ lines of assembly). The hot regions show:
-
-| Activity | % cycles (old) | % cycles (current) |
-|----------|---------------|-------------------|
-| Nibble extraction via reinterpretAsLongs | ~27% (intoArray) | **~4%** (register→scalar) |
-| `segStart`/`segEnd` array fill (scalar loops) | ~20% | **~0%** (eliminated via col-based) |
-| Vector hex conversion (LUT rearrange) | ~4% | ~4% |
-| `findDelimiters` load+compare+accumulate | ~11% | ~11% |
-| Segment boundary & empty-detection loops | ~10% | **~0%** (merged into assembly) |
-| Output assembly loop | ~8% | ~8% |
-| Collecting/validation | ~12% | ~8% |
-| GC/alloc overhead | ~4% | ~0% |
-| **Actual vector ops** | ~4% | **~15%** |
-
-**Key changes**:
-- Iteration 4: `intoArray` → `reinterpretAsLongs()` (register extraction), eliminating 64-byte writes
-- Iteration 5: Hot/cold path split for assembly loop
-- Iteration 6: `segStart[]`/`segEnd[]` arrays eliminated — compute from `col[]` on-the-fly. Removed 2 allocations, 2 fill loops, 1 validation loop.
-
-**Compare: C AVX-512 data flow**
-
-The C code's entire parse processes 45 bytes through these instructions:
-
-```
-vmovdqu8   str ← input          // 1 load
-vpcmpb    colons ← str == ':'   // 1 compare  → 64-bit mask
-vpcmpb    dots   ← str == '.'   // 1 compare  → 64-bit mask
-vpermw    str ← LUT[str]        // 1 hex convert (two 64-entry LUTs via permutex2var)
-vpmovb2m  err ← str == 0xFF     // 1 validate (move mask)
-vpcompressb comp ← str, mask     // 1 compress
-vpexpandb  pad ← comp, mask      // 1 expand
-vpmaddubsw res ← pad * 0x0110   // 1 multiply-accumulate (nibbles → bytes)
-vpmovwb   out ← res              // 1 pack (truncate 16→8 bit)
-vmovdqu8  [ptr] ← out            // 1 store (16 bytes)
-```
-
-That's ~11 vector instructions for the entire hex pipeline. All the position arithmetic (colon spacing, double-colon detection, segment counts) is done with **bit-level** operations on the mask registers — `_blsr_u64`, `_tzcnt_u32`, `_popcnt_u64`, bit shifts — in about 40 scalar instructions. Total: **~120 instructions per parse**.
+**Vector now reaches 41% of C throughput** (up from 9% baseline). The remaining gap: C does the entire pipeline in ~11 vector + 40 scalar instructions (120 total), while Java still needs ~300+ instructions for the same work.
 
 ---
 
-## Root Cause 2: Java has 4× the scalar pipeline work
+## Current Hot Profile (compress+pair approach)
 
-The C code discovers group sizes with bit arithmetic:
+From perfasm on `2001:0db8:85a3:0000:0000:8a2e:0370:7334` (39 bytes):
 
-```c
-// colons_bitvector has bits set at each colon position
-// compressed_index = compress(index_reg, colons_bitvector)
-// → 16 bytes: position of each colon (0, 4, 7, ...)
-// colon_location = cvtepu8_epi32(compressed_index)   // zero-extend to 32-bit
-// difference = colon_location - alignr(colon_location, 0, 15)  // subtract adjacent
-// num_digits = difference - 1  // strip colon itself
-```
+| Activity | % cycles | Instruction |
+|----------|----------|-------------|
+| `Long.bitCount(hexBits)` | ~26% | `popcnt` |
+| Colon position loop + validation | ~18% | `tzcnt` + `blsr` + array stores |
+| `VectorMask.fromLong` (compress) | ~11% | mask creation |
+| `indexInRange` + `fromArray` (load) | ~7% | vector load |
+| LUT `rearrange` (hex convert) | ~5% | `vpermb` |
+| `compare` + `blend` + `sub` | ~4% | hi-byte shift |
+| `compress` + 2× `rearrange` + `mul` + `or` | ~10% | pairing pipeline |
+| `reinterpretAsLongs` + 2 lane extracts | ~3% | output extraction |
+| Empty segment detection | ~6% | `col[]` scan |
+| Other (branch, alloc, return) | ~10% | misc |
 
-In 5 vector instructions + 3 bit ops, C gets a 16-element array of per-group hex-digit counts. Adding double-colon padding uses `_mm512_maskz_expand_epi32` — another 1 instruction.
-
-**Java** does the equivalent with 4 explicit int arrays:
-
-```java
-int[] col = new int[8];                   // allocation
-col[nc++] = numberOfTrailingZeros(bits);  // bit-scan loop
-int[] segStart = new int[segs];           // allocation
-int[] segEnd   = new int[segs];           // allocation
-// fill arrays with for-loops             // 3 scalar loops
-int[] grpSizes = new int[hexGroups];      // allocation
-// yet another loop to compute sizes
-```
-
-That's 4 array allocations and ~6 scalar loops to do what C does in ~8 instructions.
+**Key change**: The lane-extraction bottleneck (~50% of cycles, 5× `lv.lane()`) is **eliminated**. The compress+pair approach replaces 5 slow lane extractions + scalar bit-op loop with: 1 compress + 2 constant shuffles + 1 mul + 1 or + 2 lane extracts.
 
 ---
 
-## Root Cause 3: Per-byte validation via bit-scan loop
+## The Compress+Pair Approach (Iteration 7)
 
-The C code validates all hex digits with one instruction:
+For the all-span-4 case (the common 39-byte "full form" addresses), the hex-to-output pipeline is:
 
-```c
-error |= _mm512_movepi8_mask(str);
+```
+nibble vector r (64 bytes, 32 hex nibbles + 7 colon-fill + 17 zero)
+  ↓ compress(keepMask) — remove 7 colon positions (vpcompressb)
+hexNibs (32 contiguous nibbles in lanes 0-31)
+  ↓ rearrange(SHUFFLE_EVEN) — select nibbles 0,2,4,...,30
+evens (16 bytes, nibble[even] in output positions 0-15)
+  ↓ mul((byte)16) — nibble << 4 (vpmullb)
+shifted (16 bytes, nibble[even]<<4)
+  ↓ or(odds) — (nibble[even]<<4) | nibble[even+1]
+result (16 output bytes in lanes 0-15)
+  ↓ reinterpretAsLongs() + 2× lane(0), lane(1)
+long0 + long1 → byte[16] out
 ```
 
-This produces a 64-bit mask with bits set wherever the hex conversion produced 0xFF (invalid). Then:
+Total: **5 vector ops** (compress + 2 rearranges + mul + or) + 2 lane extracts. This replaces the previous ~50 lane-based ops.
 
-```c
-error |= (_mm512_movepi8_mask(str) & copy_mask);  // check only non-delim bytes
-```
+### Why it's fast
 
-**Java Vector** does:
+On AVX-512 (Ice Lake):
+- `vpcompressb` (1 uop, 1 cycle latency, 1/3 throughput) — requires mask from `kmovq`
+- `vpermb` with static shuffle (1 uop, 1 cycle throughput on Ice Lake)
+- `vpmullb` (1 uop, 0.5 cycle throughput on Ice Lake)
+- `vpor` (1 uop, 0.5 cycle)
+- `vextracti64x2` + `vmovq` for lane extraction (2 uops, ~3 cycles for 2 lanes)
 
-```java
-byte[] hexVals = convertHex(input, off, len);   // full vector pass, writes to array
-long nonDelimBits = ...;                         // bitmask of non-delim positions
-long tmp = nonDelimBits;
-while (tmp != 0) {                               // BIT-SCAN LOOP
-    int p = Long.numberOfTrailingZeros(tmp);     // per-byte extraction
-    if (hexVals[p] < 0) return null;
-    tmp &= tmp - 1;
-}
-```
+For comparison, the old approach:
+- 5× `vextracti64x2` + `vpermq` + `vmovq` for lane extraction (~5 uops each = 25 uops)
+- Then 8× shift+mask+copy operations in scalar code
 
-This bit-scan loop iterates once per hex digit (up to 32 iterations), with a read from `hexVals[]` and a branch each time. The perfasm confirms this is ~12% of cycles.
+### Limitation: only works for all-span-4
 
-**VectorCE** has a better approach (direct vector compare):
-
-```java
-VectorMask<Byte> invalid = nibs.compare(VectorOperators.LT, (byte) 0);
-long bad = invalid.toLong() & validLanes;
-if (bad != 0) return false;
-```
-
-This contributes to VectorCE being faster (1,578 vs 1,956 instr/op).
+The pair-assembly `nibble[even]<<4 | nibble[even+1]` assumes consecutive nibbles form a single hex group. This is only true when every segment has exactly 4 hex digits. For mixed-span inputs (e.g., `2001:db8:0:0:0:0:0:1` with spans 4,3,1,1,1,1,1,1), the scalar assembly loop is still needed.
 
 ---
 
-## Root Cause 4: Intermediate array allocations and copies
+## Remaining Bottlenecks
 
-| Phase | Vector | VectorCE |
-|-------|--------|----------|
-| hex convert | `byte[45]` hexVals (written, then read) | `byte[64]` padded + `byte[64]` tmp |
-| segments | `int[8]` col, `int[8]` segStart, `int[8]` segEnd | same + `int[8]` grpSizes |
-| output | `byte[16]` out | `byte[16]` out |
+### #1: `Long.bitCount(hexBits)` (~26%)
 
-VectorCE also does `System.arraycopy(input, off, padded, 0, len)` — a full 45-byte copy before loading into a vector.
+The popcnt intrinsic is fast (1 cycle), but C2 generates a full intrinsic call with bounds checking. The `hexBits` variable is computed as `(~delims) & ((1L << len) - 1)`, which involves two ALU ops + one popcnt.
 
-Each allocation incurs:
-- GC write barrier overhead
-- Zeroing (for int arrays)
-- Loop to fill values
+**Idea**: Cache `(~delims) & ((1L << len) - 1)` — the same value is computed earlier for validation:
+```java
+long nonDelim = (~delims) & ((1L << len) - 1);
+// validate
+if ((invalidBits & nonDelim) != 0) return null;
+// reuse for compress
+int hexChars = Long.bitCount(nonDelim);
+```
+This eliminates one recomputation.
 
-The C code allocates nothing — it uses stack variables and registers. The 120 instructions include zero memory management.
+### #2: Colon position extraction (~18%)
+
+The `while (bits != 0)` loop uses `tzcnt` + `blsr`, which is optimal but still 2-3 uops per colon. For 7 colons on a 39-byte input, that's 14-21 uops.
+
+**Idea**: Use `Long.compress` to pack colon positions into contiguous lanes, then extract as shorts (similar to the C approach). But this adds complexity.
+
+### #3: Mask creation overhead (~11%)
+
+`VectorMask.fromLong(SPECIES, hexBits)` creates a mask from the hex bitmask. On AVX-512 this compiles to `kmovq` (1 uop), but the VM adds object allocation overhead for the `VectorMask<Byte>` wrapper.
+
+**Idea**: The `compress` intrinsic could accept a raw `long` mask instead of requiring a `VectorMask` object. Not possible without API changes.
+
+### #4: Empty segment detection (~6%)
+
+The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% overhead. For the fast path (no `::`), this is wasted work.
+
+**Idea**: Move the empty detection loop to only execute when `ccPairs == 1` (i.e., `::` is present). For the common case (no `::`), skip the detection entirely.
 
 ---
 
-## Root Cause 5: Java Vector API abstraction overhead
+## Improvement Ideas (Updated)
 
-Each Vector API call goes through multiple layers:
+### ✅ Implemented in Iterations 3-7
 
-```
-ByteVector::compare(VectorOperators.EQ, delim)
-  → Byte512Vector::compare (dispatches to template method)
-  → VectorIntrinsics::compare
-  → C2 intrinsic (vpcmpeqb)
-  → returns mask as long → wrapped in VectorMask<Byte> object
-```
+| Idea | Iteration | Impact |
+|------|-----------|--------|
+| LUT-based hex conversion (single-LUT workaround) | 3.1 | +0-16% |
+| Inline long extraction via reinterpretAsLongs | 4 | +9-23% |
+| Hot/cold assembly path split | 5 | +11-13% (long input) |
+| Col-based segment bounds (kill arrays) | 6 | +7-13% |
+| **Compress+pair vector assembly** | **7** | **+82% (39-byte)** |
 
-The C code is just `_mm512_cmpeq_epu8_mask(str, colon)` — one intrinsic call directly to one instruction.
+### 🎯 High priority
 
-The broadcast operations for constants (`ByteVector.broadcast(SPECIES, (byte)'0')`) create new vector values each time. The C code uses `_mm512_set1_epi8('0')` which is folded at compile time into an embedded constant in the instruction encoding.
+**1. Cache nonDelim bitmask** — the `(~delims) & ((1L << len) - 1)` value is computed twice (once for validation, once for compress). Compute once, reuse.
 
-**Update**: The hex conversion was later optimized to use a single-LUT `rearrange` (compile to `vpermb`), replacing the 13-op chain with 5 ops:
+**2. Skip empty detection for fast path** — the `emptyCount` scan over `col[]` is wasted when `ccPairs == 0`. Move it behind the `if (ccPairs == 1)` guard.
 
-```java
-VectorMask<Byte> isHi = v.compare(VectorOperators.GE, (byte) 64);      // 1 compare
-ByteVector idx = v.blend(v.sub((byte) 64), isHi);                       // 1 sub + 1 blend
-ByteVector nibs = LUT.rearrange(idx.toShuffle());                       // 1 rearrange → vpermb
-```
+**3. Remove hexGroups*4 check overhead** — the `if (hexChars == hexGroups * 4)` branch determines whether the compress path is taken. For 39-byte inputs this is always true, but the branch check + popcnt adds ~30% overhead. Could use a simpler heuristic: `(len - nc - 1) == hexGroups * 4` which avoids the popcnt.
 
-This brings hex conversion much closer to C's `_mm512_permutex2var_epi8` — the remaining overhead is the shift+blend workaround for `toShuffle()`'s range limitation on JDK 21.
+### 🎯 Medium priority
 
-**Original code** (now replaced) — the 13-op compare+blend chain:
+**4. Multi-vector compress+pair fallback** — For AVX2 (32-byte vectors, SL=32), 39-byte inputs need 2 vectors. The multi-vector fallback currently uses `HEX_BUF`. Extend compress+pair to handle the 2-vector case.
 
-```java
-ByteVector v0 = v.sub(Z0);                                                     // 1 sub
-VectorMask<Byte> digit = v0.compare(VectorOperators.GE, (byte) 0)
-    .and(v0.compare(VectorOperators.LE, (byte) 9));                           // 2 compares + 1 and
-VectorMask<Byte> upper = v.compare(VectorOperators.GE, A)
-    .and(v.compare(VectorOperators.LE, F));                                   // 2 compares + 1 and
-VectorMask<Byte> lower = v.compare(VectorOperators.GE, a)
-    .and(v.compare(VectorOperators.LE, f));                                   // 2 compares + 1 and
-ByteVector r = N1;                                                            // 1 broadcast
-r = r.blend(v0, digit);                                                       // 1 blend
-r = r.blend(v0.sub((byte) 7),  upper);                                        // 1 sub + 1 blend
-r = r.blend(v0.sub((byte) 39), lower);                                        // 1 sub + 1 blend
-```
+**5. VectorCE compress+pair** — The `compressExpandPath` already uses `compress`. Replace its `intoArray(TMP)` + scalar loop with the pairing approach. Could also eliminate the `grpSizes[]` allocation.
 
-That's 4 compares, 3 blends, 3 subs, 2 ands, 1 broadcast = **13 vector ops** per 64-byte chunk for hex conversion.
+**6. Perfasm re-analysis** — After each iteration, re-profile to identify the new top bottleneck.
 
-C does it in **1 instruction**: `_mm512_permutex2var_epi8(lookup_lo, str, lookup_hi)`.
+### 🎯 Low priority / speculative
+
+**7. Static shuffle from Long.compress** — Instead of `VectorMask.fromLong` + `compress`, use `Long.compress(posBits, colonBits)` to get packed colon positions, then compute segment spans via subtraction. This avoids the vector mask creation overhead entirely.
+
+**8. Stack-allocated scratch arrays** — Escape analysis may already eliminate `col[8]` and `out[16]` allocations. Verify with `-XX:+PrintEscapeAnalysis`.
 
 ---
 
-## Root Cause 6: VectorCE expand mask building is scalar
+## Update the 13× instruction gap
 
-In `compressExpandPath`, the expand mask is built bit-by-bit:
+| Component | C AVX-512 | Java Vector (current) | Factor |
+|-----------|-----------|----------------------|--------|
+| Hex conversion | 1 (`vpermb`) | 5 ops (sub+compare+blend+toShuffle+rearrange) | 5× |
+| Validation | 1 (`vpmovb2m`) | 5 ops (compare+toLong+bitwise) | 5× |
+| Group size computation | ~5 vector + 8 scalar | 1 scalar loop + `tzcnt` | ~6× |
+| **Hex→byte combine** | 2 (`maddubs`+`cvtepi16`) | **5 ops (compress+2 rearranges+mul+or)** | **2.5×** |
+| Memory alloc/free | 0 | 2 arrays (`col[8]`, `out[16]`) | — |
+| Overall instructions | ~120 | ~300 | **2.5×** |
 
-```java
-long expandBits = 0;
-int bitPos = 0;
-for (int gs : grpSizes) {
-    if (gs == 0) {
-        bitPos += 4;
-    } else {
-        int shift = 4 - gs;
-        for (int k = 0; k < gs; k++)
-            expandBits |= 1L << (bitPos + shift + k);
-        bitPos += 4;
-    }
-}
-```
-
-This inner loop iterates over each hex digit position, setting bits one at a time. The C code computes the expand mask with:
-
-```c
-__m256i expand_mask_creation_register = _mm256_setr_epi8(
-    0, 0, 0, 0, 0, 0, 0, 0xff, 0, 0, 0xff, 0xff, 0, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, ...);
-// permutevar picks the right row based on digit count (1-4)
-__mmask32 expand_mask = _mm256_movepi8_mask(
-    _mm256_permutevar8x32_epi32(expand_mask_creation_register, num_digits_between_colons));
-```
-
-2 instructions: permute + move mask. The Java scalar loop contributes significantly to branch misses (VectorCE has 0.205 vs Vector's 0.042 branch misses/op).
+The gap has narrowed from **13× to 2.5×** — a 5× improvement through Iterations 3-7.
 
 ---
 
-## Summary: The 13× instruction gap
+## C Comparison: Remaining Gap
 
-| Component | C AVX-512 | Java VectorCE | Factor |
-|-----------|-----------|---------------|--------|
-| Hex conversion | 1 (`vpermb`) | 5 vector ops (sub + compare + blend + rearrange) | 5× |
-| Validation | 1 (`vpmovb2m`) | bit-scan loop + array read + branch | ~20× |
-| Group size computation | ~5 vector + 8 scalar | 6 scalar loops + 4 array allocs | ~40× |
-| Expand mask | 2 (`permutevar` + `movepi8`) | scalar bit loop per digit | ~30× |
-| Memory alloc/free | 0 | 4+ allocations, GC write barriers | — |
-| Hex digit → byte combine | 2 (`maddubs` + `cvtepi16`) | scalar loop with shift-accumulate | ~15× |
-| Overall instructions | 120 | 1,578 | **13×** |
+The C code does the full 39-byte parse in ~120 instructions. Our Java Vector now takes ~300 instructions (estimated from the halving of cycles from Iteration 6 → 7).
 
----
+C's advantages that Java cannot eliminate:
+1. **Register allocation**: C has 32 vector registers (zmm0-zmm31) and 16 GP registers — all managed by the compiler. Java's C2 has the same but must also handle object references and safepoints.
+2. **Zero abstraction overhead**: C's intrinsic calls map 1:1 to instructions. Java's Vector API layers add ~2-3× instruction count before C2 intrinsifies.
+3. **No garbage collection**: No GC write barriers, no object header overhead.
+4. **Stack allocation**: Arrays live on the stack in C. In Java, even with escape analysis, array allocation has overhead.
 
-## Improvement Ideas
-
-### 1. Eliminate intermediate arrays (highest impact)
-
-Instead of `convertHex` writing to `byte[45]` and then reading back in a bit-scan loop, combine validation with conversion. The pattern: vector-load → convert → validate-mask (one `toLong()`) → if-bad bail → write-to-out. This eliminates the hexVals array entirely and the bit-scan loop.
-
-Current flow:
-```
-load → convert → write hexVals[] → bit-scan read hexVals[] → assemble out
-```
-
-Target:
-```
-load → convert → mask-check → assemble out (no intermediate array)
-```
-
-VectorCE partially achieves this but still allocates `padded`, `tmp`, and `grpSizes`.
-
-### 2. Eliminate `System.arraycopy` for padding
-
-Instead of `arraycopy` + `fromArray`, use `ByteVector.fromArray(SPECIES, input, off, loadMask)` directly — the load mask handles the partial load. Then compress/expand work on the loaded vector. This saves 45 bytes of copy + allocation.
-
-### 3. Eliminate `tmp[]` allocation in `compressExpandPath`
-
-Currently:
-```java
-ByteVector paddedNibs = nibs.expand(expandMask);
-byte[] tmp = new byte[sl];          // allocation
-paddedNibs.intoArray(tmp, 0);
-for (int g = 0; g < hexGroups; g++) {
-    // read from tmp
-}
-```
-
-Instead, use `compare` + `toLong` or `reinterpretAsIntegral` to extract nibble pairs directly from the vector without going through a byte array. The combine operation could be done with a vector multiply-accumulate if we could map `a*16 + b` to `_mm256_maddubs_epi16`.
-
-### 4. Compute group sizes with bit operations on colon bits
-
-The C approach: compress colon positions, compute differences by subtracting shifted copy. Java can do the same:
-
-```java
-// colonBits has bits set at each colon position
-// Long.compress(indexBits, colonBits) → packed colon positions
-// Then compute differences = adjacent subtraction
-```
-
-This replaces array allocations and for-loops with a few Long operations.
-
-### 5. Pre-compute constants outside the benchmark loop
-
-Vector API broadcasts inside `convertHex` are re-executed every call. They should be `static final` class fields.
-
-### 6. Split hot/cold paths to help C2 specialization
-
-The `parse` method is too large for optimal C2 compilation. Split so the success path (which is hot) gets more aggressive optimization, while error paths (cold) are separated.
-
-### 7. Hex conversion via lookup table (applied)
-
-The `_mm512_permutex2var_epi8` approach does hex conversion in 1 instruction. We replaced the 13-op compare+blend chain with a single-LUT `rearrange`, but with a critical workaround:
-
-**The `toShuffle` range problem**: `ByteVector.toShuffle()` on JDK 21 validates shuffle indices against `VLENGTH` (64 for `Byte512Vector`), throwing `IllegalArgumentException` for any byte value ≥ 64. This means the two-table form `lo.rearrange(v.toShuffle(), hi)` crashes on uppercase/lowercase hex chars (A-F = 65-70, a-f = 97-102).
-
-**Workaround**: Subtract 64 from bytes ≥ 64 before creating the shuffle, then use a single 64-entry LUT:
-
-```java
-VectorMask<Byte> isHi = v.compare(VectorOperators.GE, (byte) 64);
-ByteVector idx = v.blend(v.sub((byte) 64), isHi);
-ByteVector nibs = LUT.rearrange(idx.toShuffle());
-```
-
-This is 5 vector ops (compare, sub, blend, toShuffle, rearrange) vs 13 for the original compare+blend chain. The single `rearrange` compiles to `vpermb` on AVX-512, giving the same hardware instruction as C's `_mm512_permutex2var_epi8`.
-
-### 8. Fuse the entire hex pipeline into a single small method
-
-The entire vector data path (load → compare → convert → compress → expand → combine → store) should be a single small method that C2 can inline and optimize holistically, similar to how the C code is a single function with ~40 operations.
+For Vector to reach C-level throughput, we'd need:
+- A way to pass colon/dot bitmasks directly to compress (avoid `VectorMask` object)
+- Eliminate the `idx.toShuffle()` wrapper (the shuffle validation + range check on JDK 21)
+- Use `vpmaddubsw` instead of `mul` + `or` for the pairing step

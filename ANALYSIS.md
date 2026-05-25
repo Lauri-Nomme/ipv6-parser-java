@@ -258,17 +258,17 @@ Same JDK and JMH config:
 
 | Address | Len | Scalar (ops/s) | SWAR (ops/s) | SWAROpt (ops/s) | Vector (ops/s) | VectorCE (ops/s) |
 |---|---|---|---|---|---|---|
-| `2001:db8::1` | 11 | 20,476,956 | 14,430,420 | 17,367,396 | **23,986,036** | 17,785,428 |
-| `::1` | 3 | 33,981,524 | 22,610,790 | 23,952,686 | **30,503,753** | 20,791,457 |
-| `2001:db8:0:0:0:0:0:1` | 22 | 12,272,839 | 9,734,620 | 12,615,082 | **21,438,690** | 13,530,499 |
-| `fe80::1` | 6 | 25,803,195 | 18,639,502 | 21,866,249 | **29,956,859** | 19,810,559 |
-| `::ffff:192.168.0.1` | 20 | 14,090,521 | 8,955,212 | 11,534,825 | **16,739,180** | 13,736,713 |
-| `2001:db8::c0a8:101` | 19 | 12,755,046 | 9,550,051 | 12,436,892 | **22,298,416** | 15,426,196 |
-| `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,482,555 | 5,730,584 | 8,399,369 | **15,771,721** | 11,283,992 |
-| `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | **15,742,091** | 11,254,086 |
-| `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | **15,772,525** | 11,284,855 |
+| `2001:db8::1` | 11 | 20,476,956 | 14,430,420 | 17,367,396 | **25,781,249** | 17,664,688 |
+| `::1` | 3 | 33,981,524 | 22,610,790 | 23,952,686 | **30,321,715** | 20,910,082 |
+| `2001:db8:0:0:0:0:0:1` | 22 | 12,272,839 | 9,734,620 | 12,615,082 | **19,521,156** | 12,039,317 |
+| `fe80::1` | 6 | 25,803,195 | 18,639,502 | 21,866,249 | **30,831,615** | 19,915,257 |
+| `::ffff:192.168.0.1` | 20 | 14,090,521 | 8,955,212 | 11,534,825 | **15,934,747** | 13,439,228 |
+| `2001:db8::c0a8:101` | 19 | 12,755,046 | 9,550,051 | 12,436,892 | **21,772,184** | 15,231,677 |
+| `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,482,555 | 5,730,584 | 8,399,369 | **28,293,008** | 11,723,049 |
+| `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | **28,122,987** | 11,743,336 |
+| `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | **28,128,279** | 11,686,738 |
 
-*Iteration 6: Eliminated `segStart[]`/`segEnd[]` arrays — compute segment bounds from `col[]` on-the-fly. Vector +7-13% across the board (e.g. 39-byte: 14.4→15.8 M/s). VectorCE +3-11%. Combined with iteration 5's hot/cold split, Vector now reaches **1.92× scalar** on 39-byte inputs.*
+*Iteration 7: Vector compress+pair assembly for the all-span-4 fast path (common 39-byte full-form). Replaces 5 long lane extractions + scalar bit-op loop (was ~50% of cycles) with 5 vector ops (compress + 2 rearranges + mul + or). 39-byte throughput nearly doubled: 15.7 → 28.1 M/s (**+79%**). Achieves **3.71× vs scalar** on long inputs. Short/cold-path inputs unchanged.*
 
 *Iteration 5: Split assembly loop into fast-path (all-hex, no `::`, no IPv4) and cold path — eliminates `isEmpty`/`isHex` branches from the hot loop. Long inputs improved +11–13% over iteration 4; short inputs unchanged.*
 
@@ -325,9 +325,9 @@ Five changes drove the improvement:
 
 | Input | 1st | 2nd | 3rd | 4th | 5th |
 |---|---|---|---|---|---|
-| Short (3–11) | **Vector 1.15–1.25×** | Scalar 1× | VectorCE 0.76–0.92× | SWAROpt 0.68–0.73× | SWAR 0.57× |
-| Medium (19–22) | **Vector 1.21–1.70×** | VectorCE 1.00–1.17× | SWAROpt 1.02× | Scalar 1× | SWAR 0.80× |
-| Long (39) | **Vector 1.92×** | VectorCE 1.38× | SWAROpt 1.09× | Scalar 1× | SWAR 0.75× |
+| Short (3–11) | **Vector 1.15–1.25×** | Scalar 1× | VectorCE 0.65–0.92× | SWAROpt 0.68–0.73× | SWAR 0.57× |
+| Medium (19–22) | **Vector 1.18–1.72×** | VectorCE 0.97–1.20× | SWAROpt 1.02× | Scalar 1× | SWAR 0.80× |
+| Long (39) | **Vector 3.71×** | VectorCE 1.51× | SWAROpt 1.16× | Scalar 1× | SWAR 0.81× |
 
 
 *Rankings updated after LUT-based hex conversion. Vector and VectorCE improved significantly on long inputs (from ~1.35× to ~1.58× and ~1.50× vs scalar respectively).*

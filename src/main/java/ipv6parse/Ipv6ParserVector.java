@@ -15,6 +15,9 @@ public class Ipv6ParserVector {
     // indices are always in [0, 64).  Digits stay at their ASCII positions
     // ('0'-'9' → 48-57), while 'A'-'F' (65-70) → 1-6 and 'a'-'f' (97-102) → 33-38.
     private static final ByteVector LUT;
+    // Shuffles for pairing 32 contiguous nibbles into 16 bytes
+    private static final VectorShuffle<Byte> SHUFFLE_EVEN;
+    private static final VectorShuffle<Byte> SHUFFLE_ODD;
     // reusable buffer for hex nibble output (single-threaded use)
     static final byte[] HEX_BUF = new byte[45];
     static {
@@ -24,6 +27,14 @@ public class Ipv6ParserVector {
         for (int i = 'A'; i <= 'F'; i++) lut[i - 64] = (byte)(i - 'A' + 10);
         for (int i = 'a'; i <= 'f'; i++) lut[i - 64] = (byte)(i - 'a' + 10);
         LUT = ByteVector.fromArray(SPECIES, lut, 0);
+        int[] even = new int[64];
+        int[] odd  = new int[64];
+        for (int i = 0; i < 16; i++) {
+            even[i] = i * 2;
+            odd[i]  = i * 2 + 1;
+        }
+        SHUFFLE_EVEN = VectorShuffle.fromArray(SPECIES, even, 0);
+        SHUFFLE_ODD  = VectorShuffle.fromArray(SPECIES, odd, 0);
     }
 
     public static byte[] parse(byte[] input) {
@@ -85,6 +96,7 @@ public class Ipv6ParserVector {
         // ---- Phase 5+6: validate, convert & assemble output ----------
         byte[] out = new byte[16];
         long delims = colonBits | dotBits;
+        long nonDelim = (~delims) & ((1L << len) - 1);
 
         if (len <= SL) {
             // Single-vector fast path: keep nibbles in register longs
@@ -95,8 +107,29 @@ public class Ipv6ParserVector {
             ByteVector r = LUT.rearrange(idx.toShuffle());
 
             long invalidBits = r.compare(VectorOperators.LT, (byte) 0).toLong();
-            if ((invalidBits & ((~delims) & ((1L << len) - 1))) != 0) return null;
+            if ((invalidBits & nonDelim) != 0) return null;
 
+            if (emptyCount == 0 && !hasDot) {
+                // Hot path: all hex segments, no ::, no IPv4
+                int hexChars = Long.bitCount(nonDelim);
+                if (hexChars == hexGroups * 4) {
+                    // All segments span exactly 4 chars — vector compress+pair
+                    VectorMask<Byte> keep = VectorMask.fromLong(SPECIES, nonDelim);
+                    ByteVector hexNibs = r.compress(keep);
+                    ByteVector evens = hexNibs.rearrange(SHUFFLE_EVEN);
+                    ByteVector odds  = hexNibs.rearrange(SHUFFLE_ODD);
+                    ByteVector result = evens.mul((byte) 16).or(odds);
+                    LongVector rlv = (LongVector) result.reinterpretAsLongs();
+                    long ol0 = rlv.lane(0), ol1 = rlv.lane(1);
+                    for (int i = 0; i < 8; i++) {
+                        out[i] = (byte)(ol0 >> (i * 8));
+                        out[i + 8] = (byte)(ol1 >> (i * 8));
+                    }
+                    return out;
+                }
+            }
+
+            // Extract longs from nibble vector (needed for mixed-span fast path and cold path)
             LongVector lv = (LongVector) r.reinterpretAsLongs();
             int nLongs = (len + 7) / 8;
             long n0 = 0, n1 = 0, n2 = 0, n3 = 0, n4 = 0, n5 = 0;
@@ -108,7 +141,7 @@ public class Ipv6ParserVector {
             if (nLongs > 5) n5 = lv.lane(5);
 
             if (emptyCount == 0 && !hasDot) {
-                // Hot path: all hex segments, no ::, no IPv4
+                // Mixed-span fast path
                 for (int i = 0; i < segs; i++) {
                     int start = i == 0 ? 0 : col[i - 1] + 1;
                     int end = i == nc ? len : col[i];
