@@ -48,29 +48,22 @@ public class Ipv6ParserVector {
         long colonBits = findDelimiters(input, off, len, (byte) ':');
         long dotBits   = findDelimiters(input, off, len, (byte) '.');
 
-        int[] col = new int[8];
-        int nc = 0;
-        long bits = colonBits;
-        while (bits != 0 && nc < 8) {
-            col[nc++] = Long.numberOfTrailingZeros(bits);
-            bits &= bits - 1;
-        }
+        int nc = Long.bitCount(colonBits);
         if (nc == 0) return null;
-
-        int ccPairs = 0;
-        for (int i = 1; i < nc; i++) {
-            if (col[i] == col[i - 1] + 1) ccPairs++;
-        }
+        int ccPairs = Long.bitCount(colonBits & (colonBits >> 1));
         if (ccPairs > 1) return null;
 
         boolean hasDot = dotBits != 0;
         int dotCount = Long.bitCount(dotBits);
+
+        int[] col = new int[8];
 
         // ---- Phase 2: detect empty segments & validate ----------------
         int segs = nc + 1;
         int emptyCount = 0;
         boolean emptiesConsecutive = true;
         if (ccPairs > 0) {
+            fillColonPositions(colonBits, col);
             int lastEmptyIdx = -2;
             for (int i = 0; i <= nc; i++) {
                 int start = i == 0 ? 0 : col[i - 1] + 1;
@@ -134,6 +127,9 @@ public class Ipv6ParserVector {
             if (nLongs > 3) n3 = lv.lane(3);
             if (nLongs > 4) n4 = lv.lane(4);
             if (nLongs > 5) n5 = lv.lane(5);
+
+            // Fill colon positions if not done yet (for non-compress+pair paths)
+            if (ccPairs == 0) fillColonPositions(colonBits, col);
 
             if (emptyCount == 0 && !hasDot) {
                 // Mixed-span fast path
@@ -204,6 +200,7 @@ public class Ipv6ParserVector {
         } else {
             // Multi-vector fallback: convert to HEX_BUF, then assemble
             if (!convertHex(input, off, len, colonBits, dotBits)) return null;
+            if (ccPairs == 0) fillColonPositions(colonBits, col);
             int oi = 0;
             boolean ddInserted = false;
             for (int i = 0; i < segs; i++) {
@@ -286,6 +283,13 @@ public class Ipv6ParserVector {
     // -----------------------------------------------------------------
     //  IPv4 suffix (scalar — tiny, not worth vectorizing)
     // -----------------------------------------------------------------
+
+    private static void fillColonPositions(long bits, int[] col) {
+        for (int i = 0; bits != 0; i++) {
+            col[i] = Long.numberOfTrailingZeros(bits);
+            bits &= bits - 1;
+        }
+    }
 
     static void ipv4Suffix(byte[] b, int off, int len, byte[] out, int oi) {
         int[] dotPos = new int[3];
