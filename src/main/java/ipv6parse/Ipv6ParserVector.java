@@ -94,8 +94,6 @@ public class Ipv6ParserVector {
 
         // ---- Phase 5+6: validate, convert & assemble output ----------
         byte[] out = new byte[16];
-        int oi = 0;
-        boolean ddInserted = false;
         long delims = colonBits | dotBits;
 
         if (len <= SL) {
@@ -119,6 +117,34 @@ public class Ipv6ParserVector {
             if (nLongs > 4) n4 = lv.lane(4);
             if (nLongs > 5) n5 = lv.lane(5);
 
+            if (emptyCount == 0 && !hasDot) {
+                // Hot path: all hex segments, no ::, no IPv4
+                for (int i = 0; i < segs; i++) {
+                    int start = segStart[i], span = segEnd[i] - start;
+                    if (span < 1 || span > 4) return null;
+                    int li = start / 8, bo = (start % 8) * 8;
+                    long chunk = switch (li) {
+                        case 0 -> n0; case 1 -> n1; case 2 -> n2;
+                        case 3 -> n3; case 4 -> n4; case 5 -> n5;
+                        default -> 0; } >>> bo;
+                    int hexVal;
+                    switch (span) {
+                        case 1 -> hexVal = (int)(chunk) & 0xFF;
+                        case 2 -> hexVal = ((int)(chunk) & 0xFF) << 4 | ((int)(chunk >>> 8) & 0xFF);
+                        case 3 -> hexVal = ((int)(chunk) & 0xFF) << 8 | ((int)(chunk >>> 8) & 0xFF) << 4 | ((int)(chunk >>> 16) & 0xFF);
+                        case 4 -> hexVal = ((int)(chunk) & 0xFF) << 12 | ((int)(chunk >>> 8) & 0xFF) << 8
+                                        | ((int)(chunk >>> 16) & 0xFF) << 4 | ((int)(chunk >>> 24) & 0xFF);
+                        default -> hexVal = 0;
+                    }
+                    out[i * 2] = (byte)(hexVal >> 8);
+                    out[i * 2 + 1] = (byte)hexVal;
+                }
+                return out;
+            }
+
+            // Cold path: handle :: or IPv4
+            int oi = 0;
+            boolean ddInserted = false;
             for (int i = 0; i < segs; i++) {
                 boolean isEmpty = segStart[i] == segEnd[i];
                 boolean isLast  = i == segs - 1;
@@ -131,7 +157,6 @@ public class Ipv6ParserVector {
                     }
                 } else if (isHex) {
                     int start = segStart[i], span = segEnd[i] - start;
-                    if (span < 1 || span > 4) return null;
                     int li = start / 8, bo = (start % 8) * 8;
                     long chunk = switch (li) {
                         case 0 -> n0; case 1 -> n1; case 2 -> n2;
@@ -157,6 +182,8 @@ public class Ipv6ParserVector {
         } else {
             // Multi-vector fallback: convert to HEX_BUF, then assemble
             if (!convertHex(input, off, len, colonBits, dotBits)) return null;
+            int oi = 0;
+            boolean ddInserted = false;
             for (int i = 0; i < segs; i++) {
                 boolean isEmpty = segStart[i] == segEnd[i];
                 boolean isLast  = i == segs - 1;
@@ -169,7 +196,6 @@ public class Ipv6ParserVector {
                     }
                 } else if (isHex) {
                     int start = segStart[i], span = segEnd[i] - start;
-                    if (span < 1 || span > 4) return null;
                     int v = 0;
                     for (int j = 0; j < span; j++) v = (v << 4) | (HEX_BUF[start + j] & 0xFF);
                     out[oi++] = (byte)(v >> 8);
@@ -182,7 +208,7 @@ public class Ipv6ParserVector {
             }
         }
 
-        return oi == 16 ? out : null;
+        return out;
     }
 
     // -----------------------------------------------------------------

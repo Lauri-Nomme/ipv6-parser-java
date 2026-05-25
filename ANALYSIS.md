@@ -258,17 +258,17 @@ Same JDK and JMH config:
 
 | Address | Len | Scalar (ops/s) | SWAR (ops/s) | SWAROpt (ops/s) | Vector (ops/s) | VectorCE (ops/s) |
 |---|---|---|---|---|---|---|
-| `2001:db8::1` | 11 | 20,476,956 | 14,430,420 | 17,367,396 | **24,668,720** | 16,363,587 |
-| `::1` | 3 | 33,981,524 | 22,610,790 | 23,952,686 | **28,860,403** | 19,163,961 |
-| `2001:db8:0:0:0:0:0:1` | 22 | 12,272,839 | 9,734,620 | 12,615,082 | **18,708,596** | 12,641,302 |
-| `fe80::1` | 6 | 25,803,195 | 18,639,502 | 21,866,249 | **27,526,422** | 18,674,314 |
-| `::ffff:192.168.0.1` | 20 | 14,090,521 | 8,955,212 | 11,534,825 | **15,432,868** | 12,253,665 |
-| `2001:db8::c0a8:101` | 19 | 12,755,046 | 9,550,051 | 12,436,892 | **19,771,459** | 13,934,134 |
-| `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,482,555 | 5,730,584 | 8,399,369 | **12,781,149** | 11,180,723 |
-| `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | **12,775,842** | 11,215,749 |
-| `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | **12,835,133** | 11,161,607 |
+| `2001:db8::1` | 11 | 20,476,956 | 14,430,420 | 17,367,396 | **24,592,423** | 16,503,506 |
+| `::1` | 3 | 33,981,524 | 22,610,790 | 23,952,686 | **28,519,452** | 19,495,034 |
+| `2001:db8:0:0:0:0:0:1` | 22 | 12,272,839 | 9,734,620 | 12,615,082 | **18,858,375** | 12,859,280 |
+| `fe80::1` | 6 | 25,803,195 | 18,639,502 | 21,866,249 | **27,422,803** | 18,451,587 |
+| `::ffff:192.168.0.1` | 20 | 14,090,521 | 8,955,212 | 11,534,825 | **15,371,379** | 12,518,043 |
+| `2001:db8::c0a8:101` | 19 | 12,755,046 | 9,550,051 | 12,436,892 | **19,639,209** | 13,773,008 |
+| `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,482,555 | 5,730,584 | 8,399,369 | **14,404,550** | 10,495,176 |
+| `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | **14,312,327** | 10,462,855 |
+| `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | **14,448,965** | 10,505,250 |
 
-*Update: Inline long extraction (Iteration 4) eliminated the intoArray write by using `reinterpretAsLongs()` to keep nibble values in register longs. Vector now beats scalar on ALL inputs — 1.26× on short, 1.46× on medium, 1.66× on long. This closed the gap with C's `vpermb` + `vpmovb2m` approach.*
+*Iteration 5: Split assembly loop into fast-path (all-hex, no `::`, no IPv4) and cold path — eliminates `isEmpty`/`isHex` branches from the hot loop. Long inputs improved +11–13% over iteration 4; short inputs unchanged.*
 
 ### Analysis
 
@@ -323,9 +323,9 @@ Five changes drove the improvement:
 
 | Input | 1st | 2nd | 3rd | 4th | 5th |
 |---|---|---|---|---|---|
-| Short (3–11) | **Vector 1.26×** | Scalar 1× | SWAROpt 0.99× | VectorCE 0.76× | SWAR 0.69× |
-| Medium (19–22) | **Vector 1.46×** | SWAROpt 1.02× | VectorCE 0.98× | Scalar 1× | SWAR 0.75× |
-| Long (39) | **Vector 1.66×** | VectorCE 1.44× | SWAROpt 1.10× | Scalar 1× | SWAR 0.73× |
+| Short (3–11) | **Vector 1.27×** | Scalar 1× | SWAROpt 0.98× | VectorCE 0.76× | SWAR 0.72× |
+| Medium (19–22) | **Vector 1.50×** | SWAROpt 1.07× | VectorCE 0.96× | Scalar 1× | SWAR 0.79× |
+| Long (39) | **Vector 1.72×** | VectorCE 1.22× | SWAROpt 1.11× | Scalar 1× | SWAR 0.76× |
 
 
 *Rankings updated after LUT-based hex conversion. Vector and VectorCE improved significantly on long inputs (from ~1.35× to ~1.58× and ~1.50× vs scalar respectively).*
