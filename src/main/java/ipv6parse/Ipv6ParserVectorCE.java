@@ -27,8 +27,6 @@ public class Ipv6ParserVectorCE {
     // indices are always in [0, 64).  Digits stay at their ASCII positions
     // ('0'-'9' → 48-57), while 'A'-'F' (65-70) → 1-6 and 'a'-'f' (97-102) → 33-38.
     private static final ByteVector LUT;
-    // reusable buffer for nibble extraction (compressExpandPath only, single-threaded)
-    private static final byte[] TMP = new byte[SL];
     static {
         byte[] lut = new byte[64];
         for (int i = 0; i < 64; i++) lut[i] = -1;
@@ -217,15 +215,12 @@ public class Ipv6ParserVectorCE {
         // expand → each group has 4 nibbles, leading zeros filled
         ByteVector paddedNibs = nibs.expand(expandMask);
 
-        // combine 2 nibbles → 1 byte
-        paddedNibs.intoArray(TMP, 0);
+        // combine 2 nibbles → 1 byte via vector shuffle+mul+or
         int hexGroups = hasDot ? 6 : 8;
-        int oi = 0;
-        int ti = 0;
-        for (int g = 0; g < hexGroups; g++, ti += 4) {
-            out[oi++] = (byte)(((TMP[ti] & 0xFF) << 4) | (TMP[ti + 1] & 0xFF));
-            out[oi++] = (byte)(((TMP[ti + 2] & 0xFF) << 4) | (TMP[ti + 3] & 0xFF));
-        }
+        ByteVector evens = paddedNibs.rearrange(Ipv6ParserVector.SHUFFLE_EVEN);
+        ByteVector odds  = paddedNibs.rearrange(Ipv6ParserVector.SHUFFLE_ODD);
+        ByteVector paired = evens.mul((byte) 16).or(odds);
+        paired.intoArray(out, 0, SPECIES.indexInRange(0, hexGroups * 2));
         return true;
     }
 
