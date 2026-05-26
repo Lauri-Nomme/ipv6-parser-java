@@ -115,7 +115,7 @@ public class Ipv6ParserVector {
                 }
                 // Mixed-span fast path: compress + expand(per-segment pad) + pair
                 // Replaces per-segment scalar extraction with vector compress+expand+pair
-                long expandBits = computeExpandMask(colonBits, len, nc, segs);
+                long expandBits = computeExpandMask(colonBits, len, nc, segs, pad);
                 if (expandBits == -1L) return null; // invalid span
                 ByteVector hexNibs = r.compress(keep);
                 ByteVector padded = hexNibs.expand(VectorMask.fromLong(SPECIES, expandBits));
@@ -126,7 +126,21 @@ public class Ipv6ParserVector {
                 return out;
             }
 
-            // Extract longs from nibble vector (needed for cold path)
+            // Cold path: compress+expand+pair for :: without IPv4
+            if (emptyCount > 0 && !hasDot) {
+                long expandBits = computeExpandMask(colonBits, len, nc, segs, pad);
+                if (expandBits != -1L) {
+                    ByteVector hexNibs = r.compress(keep);
+                    ByteVector padded = hexNibs.expand(VectorMask.fromLong(SPECIES, expandBits));
+                    ByteVector evens = padded.rearrange(SHUFFLE_EVEN);
+                    ByteVector odds  = padded.rearrange(SHUFFLE_ODD);
+                    ByteVector paired = evens.mul((byte) 16).or(odds);
+                    paired.intoArray(out, 0, SPECIES.indexInRange(0, 16));
+                    return out;
+                }
+            }
+
+            // Extract longs from nibble vector (needed for per-segment loop)
             LongVector lv = (LongVector) r.reinterpretAsLongs();
             int nLongs = (len + 7) / 8;
             long n0 = 0, n1 = 0, n2 = 0, n3 = 0, n4 = 0, n5 = 0;
@@ -137,10 +151,10 @@ public class Ipv6ParserVector {
             if (nLongs > 4) n4 = lv.lane(4);
             if (nLongs > 5) n5 = lv.lane(5);
 
-            // Fill colon positions for per-segment loop (IPv4 suffix or ::)
+            // Fill colon positions for per-segment loop (IPv4 suffix)
             if (ccPairs == 0) fillColonPositions(colonBits, col);
 
-            // Fallback: per-segment loop (IPv4 suffix or :: with pad)
+            // Fallback: per-segment loop (IPv4 suffix or expand failed)
             int oi = 0;
             boolean ddInserted = false;
             for (int i = 0; i < segs; i++) {
@@ -282,17 +296,21 @@ public class Ipv6ParserVector {
      *  Each segment gets 4 nibble-slot positions with right-aligned padding.
      *  Empty segments (span=0) produce all zeros in their slot.
      *  Returns -1L if any non-empty segment has an invalid span. */
-    private static long computeExpandMask(long colonBits, int len, int nc, int segs) {
+    private static long computeExpandMask(long colonBits, int len, int nc, int segs, int pad) {
         long expandBits = 0;
         int bitPos = 0;
         int start = 0;
         long bits = colonBits;
+        boolean emptyExpanded = false;
         for (int i = 0; i < segs; i++) {
             int end = i < nc ? Long.numberOfTrailingZeros(bits) : len;
             int span = end - start;
             if (span == 0) {
-                // empty segment from :: : just advance past its 4 nibble slots
-                bitPos += 4;
+                // first empty segment (from ::) expands to pad zero groups
+                if (!emptyExpanded) {
+                    bitPos += pad * 4;
+                    emptyExpanded = true;
+                }
                 if (i < nc) bits &= bits - 1;
                 start = end + 1;
                 continue;

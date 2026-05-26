@@ -21,7 +21,7 @@ Our Java on **i9-11950H @ 2.6 GHz** (also Ice Lake, 64-byte vectors) -- **curren
 | **Vector** | **60.0** | **7.6x** | **0.84x** |
 | C AVX-512 | 71.3 | ~9.0x | 1x |
 
-**Iteration 12: Eliminate `VectorMask.fromLong(nonDelim)` — reuse `compare(GE, 0)` mask from validation for compress, saving one compare + one fromLong per path. +3% on hot path (58.1→60.0 M/s). Removed buggy cold-path compress+expand+pair (didn't handle `::` pad expansion).**
+**Iteration 13: Fix `computeExpandMask` to handle `::` pad expansion — first empty segment now allocates `pad*4` zero nibble slots. Cold :: compress+expand+pair paths restored with correct pad handling. :: addresses +27% (26.3→33.5 M/s). Also moved long lane extraction after the cold-path check to avoid wasted work on the compress+expand+pair path.**
 
 ---
 
@@ -138,6 +138,7 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 | **VectorCE TMP→shuffle+mul+or (non-all-span-4)** | **11a** | **~85 fewer instr** |
 | **Mixed-span & cold-path compress+expand+pair** | **11b** | **+29% mixed** |
 | **Eliminate fromLong(nonDelim), reuse compare mask** | **12** | **+3% hot path** |
+| **Fix :: pad expansion in computeExpandMask** | **13** | **+27% :: (26.3→33.5 M/s)** |
 
 ### 🎯 High priority
 

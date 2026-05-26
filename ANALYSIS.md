@@ -268,6 +268,8 @@ Same JDK and JMH config:
 | `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | **28,122,987** | 11,743,336 |
 | `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | **28,128,279** | 11,686,738 |
 
+*Iteration 13: Fix `computeExpandMask` to handle `::` pad expansion — first empty segment allocates `pad*4` zero nibble slots. Cold :: compress+expand+pair restored with correct pad handling. `2001:db8::1`: 26.3 -> 33.5 M/s (**+27%**), `fe80::1`: 31.3 -> 35.4 M/s (**+13%**). Long lane extraction moved after cold-path check to avoid wasted work.*
+
 *Iteration 12: Eliminate `VectorMask.fromLong(nonDelim)` — reuse `compare(GE, 0)` mask for both validation and compress. Saves one compare and one fromLong per path. 39-byte hot path: 58.1 -> 60.0 M/s (**+3%**). Reverted buggy cold-path compress+expand+pair (didn't handle `::` pad expansion).*
 
 *Iteration 11b: Cold-path compress+expand+pair for `::`-without-IPv4 (later reverted — pad bug). Mixed-span path also uses compress+expand+pair — 27.1 -> 35.0 M/s (**+29%**).*
