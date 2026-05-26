@@ -254,6 +254,8 @@ SWAROpt is **38–43% faster than SWAR** on 39-byte inputs (vs 29% on AVX-512 i9
 
 ### AVX-512 (11th Gen Intel Core i9-11950H @ 2.60 GHz, SPECIES = 64 bytes)
 
+> **Note**: Numbers below are from Iteration 10 vintage. Current Iteration 14 Vector reaches 60.0 M/s on 39-byte (up from 28 M/s here) and 38.6 M/s on mixed-span (up from 19.5). See iteration notes below for latest.
+
 Same JDK and JMH config:
 
 | Address | Len | Scalar (ops/s) | SWAR (ops/s) | SWAROpt (ops/s) | Vector (ops/s) | VectorCE (ops/s) |
@@ -267,6 +269,8 @@ Same JDK and JMH config:
 | `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,482,555 | 5,730,584 | 8,399,369 | **28,293,008** | 11,723,049 |
 | `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | **28,122,987** | 11,743,336 |
 | `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | **28,128,279** | 11,686,738 |
+
+*Iteration 14: Replace even/odd rearranges + mul + or with short-vector pairing (`pairNibbles`). Instead of `vpermb`×2 (port 5) to separate even/odd nibbles then pair, reinterpret as shorts, combine via short arithmetic (`and`, `shift`, `and`, `mul`, `or` — all port 0/1), then `vpcompressb` every other byte (port 5). Saves 1 port-5 operation per path: mixed-span 34.3 -> 38.6 M/s (**+12.5%**). Hot/cold paths show marginal improvement (port 5 was not the sole bottleneck). IPv4 suffix path unchanged (same per-segment loop — rare in prod input).*
 
 *Iteration 13: Fix `computeExpandMask` to handle `::` pad expansion — first empty segment allocates `pad*4` zero nibble slots. Cold :: compress+expand+pair restored with correct pad handling. `2001:db8::1`: 26.3 -> 33.5 M/s (**+27%**), `fe80::1`: 31.3 -> 35.4 M/s (**+13%**). Long lane extraction moved after cold-path check to avoid wasted work.*
 

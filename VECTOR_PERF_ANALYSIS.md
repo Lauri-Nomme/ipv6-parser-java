@@ -12,14 +12,16 @@ Blog (2026-05-23) on **Xeon Gold 6548N @ 2.8 GHz** with GCC `-O3`:
 
 Our Java on **i9-11950H @ 2.6 GHz** (also Ice Lake, 64-byte vectors) -- **current**:
 
-| Parser | 39-byte M/s | vs Scalar | vs C |
-|--------|------------|-----------|------|
-| Scalar | 7.9 | 1x | 0.11x |
-| SWAR | 5.7 | 0.72x | 0.08x |
-| SWAROpt | 8.4 | 1.06x | 0.12x |
-| VectorCE | 15.8 | 2.0x | 0.22x |
-| **Vector** | **60.0** | **7.6x** | **0.84x** |
-| C AVX-512 | 71.3 | ~9.0x | 1x |
+| Parser | 39-byte M/s | mixed-span M/s | vs Scalar | vs C |
+|--------|------------|----------------|-----------|------|
+| Scalar | 7.9 | 7.9 | 1x | 0.11x |
+| SWAR | 5.7 | 5.7 | 0.72x | 0.08x |
+| SWAROpt | 8.4 | 8.4 | 1.06x | 0.12x |
+| VectorCE | 15.8 | ~11.1 | 2.0x | 0.22x |
+| **Vector** | **60.0** | **38.6** | **7.6x** | **0.84x** |
+| C AVX-512 | 71.3 | — | ~9.0x | 1x |
+
+**Iteration 14: Replace even/odd rearranges (2× `vpermb` port 5) with short-vector pairing (`pairNibbles`). Reinterpret as shorts, combine via `and`+`shift`+`and`+`mul`+`or` (port 0/1), then `vpcompressb` every other byte (port 5). Saves 1 port-5 operation per path. Mixed-span 34.3→38.6 M/s (+12.5%). Hot path marginal (port 5 not sole bottleneck). IPv4 suffix unchanged (per-segment loop — rare in prod).**
 
 **Iteration 13: Fix `computeExpandMask` to handle `::` pad expansion — first empty segment now allocates `pad*4` zero nibble slots. Cold :: compress+expand+pair paths restored with correct pad handling. :: addresses +27% (26.3→33.5 M/s). Also moved long lane extraction after the cold-path check to avoid wasted work on the compress+expand+pair path.**
 
@@ -44,42 +46,47 @@ From perfasm on `2001:0db8:85a3:0000:0000:8a2e:0370:7334` (39 bytes):
 
 ---
 
-## The Compress+Pair Approach (Iteration 7)
+## The Compress+Pair Approach (Iteration 7) → Short-Vector Pairing (Iteration 14)
 
 For the all-span-4 case (the common 39-byte "full form" addresses), the hex-to-output pipeline is:
 
+**Original (Iteration 7-13, 2 port-5 ops):**
 ```
-nibble vector r (64 bytes, 32 hex nibbles + 7 colon-fill + 17 zero)
-  ↓ compress(keepMask) — remove 7 colon positions (vpcompressb)
-hexNibs (32 contiguous nibbles in lanes 0-31)
-  ↓ rearrange(SHUFFLE_EVEN) — select nibbles 0,2,4,...,30
+hexNibs (32 contiguous nibbles)
+  ↓ rearrange(SHUFFLE_EVEN) — port 5
 evens (16 bytes, nibble[even] in output positions 0-15)
-  ↓ mul((byte)16) — nibble << 4 (vpmullb)
-shifted (16 bytes, nibble[even]<<4)
-  ↓ or(odds) — (nibble[even]<<4) | nibble[even+1]
-result (16 output bytes in lanes 0-15)
-  ↓ reinterpretAsLongs() + 2× lane(0), lane(1)
-long0 + long1 → byte[16] out
+  ↓ mul((byte)16) — port 0/1
+shifted
+  ↓ or(rearrange(SHUFFLE_ODD)) — port 5 + port 0/1
+result (16 bytes)
 ```
 
-Total: **5 vector ops** (compress + 2 rearranges + mul + or) + 2 lane extracts. This replaces the previous ~50 lane-based ops.
+**Current (Iteration 14, 1 port-5 op):**
+```
+hexNibs (32 contiguous nibbles in lanes 0-31, lanes 32-63 zero)
+  ↓ reinterpretAsShorts() — zero cost (retype)
+short pairs (16 shorts: hi nibble in lo byte, lo nibble in hi byte of each nibble pair)
+  ↓ and(0x00FF_00FF per short) + shift(8) — mask nibble[even], shift nibble[odd]
+  ↓ and(0xFF00_FF00 per short) + mul((short)256) — swap nibble[odd]×256 (same as <<8)
+  ↓ or — combine into paired byte per short
+paired (16 bytes: each short → one paired byte, lo lane)
+  ↓ compress(0xAAAA) — keep every other byte (port 5)
+result (8 byte pairs in lanes 0-7)
+  ↓ reinterpretAsLongs() + lane(0)
+long → byte[8] out (first half)
+```
 
-### Why it's fast
+Actually simpler: `and(lo_mask)` extracts nibble[even] into lo byte of each short; `and(hi_mask)` extracts nibble[odd] then `mul(256)` shifts it 8 bits left; `or` combines → each short has `(nibble[even]<<4 | nibble[odd])` in its lo byte. Then `compress(0xAAAA)` keeps every other byte (bytes 0,2,4,... = the 8 paired values).
 
-On AVX-512 (Ice Lake):
-- `vpcompressb` (1 uop, 1 cycle latency, 1/3 throughput) — requires mask from `kmovq`
-- `vpermb` with static shuffle (1 uop, 1 cycle throughput on Ice Lake)
-- `vpmullb` (1 uop, 0.5 cycle throughput on Ice Lake)
-- `vpor` (1 uop, 0.5 cycle)
-- `vextracti64x2` + `vmovq` for lane extraction (2 uops, ~3 cycles for 2 lanes)
+Total: **4 vector ops** (3 port 0/1 + 1 port 5 compress). Replaced 2 port-5 rearranges + mul + or (4 ops) with 3 port 0/1 + 1 port 5.
 
-For comparison, the old approach:
-- 5× `vextracti64x2` + `vpermq` + `vmovq` for lane extraction (~5 uops each = 25 uops)
-- Then 8× shift+mask+copy operations in scalar code
+### Why it helps
 
-### Limitation: only works for all-span-4
+On Ice Lake, port 5 is shared by `vpermb`, `vpcompressb`, `vextracti64x2`, `vpermq`. Mixed-span path had 4 port-5 ops (compress + 2 rearranges + compress for output). Now 3 port-5 ops (compress + compress + compress). Hot path: 3→2 port-5 ops.
 
-The pair-assembly `nibble[even]<<4 | nibble[even+1]` assumes consecutive nibbles form a single hex group. This is only true when every segment has exactly 4 hex digits. For mixed-span inputs (e.g., `2001:db8:0:0:0:0:0:1` with spans 4,3,1,1,1,1,1,1), the scalar assembly loop is still needed.
+### Limitation: mixed-span still slower
+
+Mixed-span inputs (e.g., `2001:db8:0:0:0:0:0:1`) still need compress+expand+pair — the pairing step itself is optimized, but the expand mask construction and per-segment extraction overhead remain.
 
 ---
 
@@ -111,7 +118,13 @@ The `while (bits != 0)` loop uses `tzcnt` + `blsr`, which is optimal but still 2
 
 **Idea**: The `compress` intrinsic could accept a raw `long` mask instead of requiring a `VectorMask` object. Not possible without API changes.
 
-### #4: Empty segment detection (~6%)
+### #4: Port-5 pressure (~20% stall)
+
+The pairing path now has 3 port-5 operations per mixed-span path (compress for hex extraction + compress for output filtering + compress after short-vector pairing). Port 5 is shared by `vpermb`, `vpcompressb`, `vextracti64x2`, `vpermq` on Ice Lake — it's the narrowest execution port with only 1/cycle throughput for these ops.
+
+**Status**: Iteration 14 reduced port-5 count from 4→3 (mixed-span) and 3→2 (hot path). The mixed-span path got +12.5% from this. Further reductions would require eliminating the post-pairing compress (e.g., using `vpmaddubsw` + `vpackuswb` to pair and pack in one step).
+
+### #5: Empty segment detection (~6%)
 
 The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% overhead. For the fast path (no `::`), this is wasted work.
 
@@ -139,6 +152,7 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 | **Mixed-span & cold-path compress+expand+pair** | **11b** | **+29% mixed** |
 | **Eliminate fromLong(nonDelim), reuse compare mask** | **12** | **+3% hot path** |
 | **Fix :: pad expansion in computeExpandMask** | **13** | **+27% :: (26.3→33.5 M/s)** |
+| **Short-vector pairing (pairNibbles) — port-5 fix** | **14** | **+12.5% mixed-span** |
 
 ### 🎯 High priority
 
@@ -148,7 +162,7 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 
 ### 🎯 Medium priority
 
-**3. ::+IPv4 cold path** -- The IPv4 suffix (span > 4) still falls through to the per-segment loop at 17 M/s. SWAR decimal→binary parsing could replace the scalar loop.
+**3. ::+IPv4 cold path** -- The IPv4 suffix (span > 4) still falls through to the per-segment loop at ~17 M/s. SWAR decimal→binary parsing could replace the scalar loop. Note: IPv4 suffix is rare in production input (modern IPv6 deployments rarely embed legacy IPv4 addresses).
 
 **4. Skip validation checks on fast path** -- The `len - nc` and validation checks are always true on the compress+pair path. Could restructure to avoid the branch.
 
@@ -156,7 +170,7 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 
 **5. Stack-allocated scratch arrays** -- Escape analysis may already eliminate `col[8]` and `out[16]` allocations.
 
-**6. vpmaddubsw for pairing** -- Instead of `mul` + `or`, use multiply-add semantics via `vpmaddubsw` + `vpackuswb`.
+**6. vpmaddubsw for pairing + packing** -- Instead of short-vector pairing followed by compress, use `vpmaddubsw` to multiply-accumulate nibble pairs into 16-bit values, then `vpackuswb` to pack to bytes. This would eliminate the post-pairing compress (port 5). Not possible without `vpmaddubsw` intrinsic in Vector API.
 
 ---
 
@@ -167,7 +181,7 @@ The for-loop over `col[]` to detect empty segments (`start == end`) adds ~6% ove
 | Hex conversion | 1 (`vpermb`) | 5 ops (sub+compare+blend+toShuffle+rearrange) | 5x |
 | Validation | 1 (`vpmovb2m`) | 5 ops (compare+toLong+bitwise) | 5x |
 | Colon detection + counting | 1 (`vpcmpb`+`popcnt`) | 3 ops (compare+toLong+popcnt) | 3x |
-| **Hex->byte combine** | 2 (`maddubs`+`cvtepi16`) | **5 ops (compress+2 rearranges+mul+or)** | **2.5x** |
+| **Hex->byte combine** | 2 (`maddubs`+`cvtepi16`) | **4 ops (compress+and+shift+and+mul+or via shorts + compress)** | **2x** |
 | **Output write** | 1 (`vmovdqu8`) | **1 (`vmovdqu8` with mask)** | **1x** |
 | Memory alloc/free | 0 | 1 array (`out[16]`) | -- |
 | Overall instructions | ~120 | ~150 | **1.25x** |
@@ -189,4 +203,5 @@ C's advantages that Java cannot eliminate:
 For Vector to reach C-level throughput, we'd need:
 - A way to pass colon/dot bitmasks directly to compress (avoid `VectorMask` object)
 - Eliminate the `idx.toShuffle()` wrapper (the shuffle validation + range check on JDK 21)
-- Use `vpmaddubsw` instead of `mul` + `or` for the pairing step
+- Eliminate the post-pairing `vpcompressb` (port 5) — `vpmaddubsw` + `vpackuswb` could pair and pack without compress
+- Remove the per-byte nibble extraction: pair directly from hex chars using multiply-add, avoiding the LUT hex conversion entirely

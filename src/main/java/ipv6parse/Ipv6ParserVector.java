@@ -2,6 +2,7 @@ package ipv6parse;
 
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.LongVector;
+import jdk.incubator.vector.ShortVector;
 import jdk.incubator.vector.VectorMask;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorShuffle;
@@ -20,6 +21,7 @@ public class Ipv6ParserVector {
     static final VectorShuffle<Byte> SHUFFLE_ODD;
     // reusable buffer for hex nibble output (single-threaded use)
     static final byte[] HEX_BUF = new byte[45];
+
     static {
         byte[] lut = new byte[64];
         for (int i = 0; i < 64; i++) lut[i] = -1;
@@ -107,35 +109,26 @@ public class Ipv6ParserVector {
                 if (len - nc == hexGroups * 4) {
                     // All segments span exactly 4 chars — vector compress+pair
                     ByteVector hexNibs = r.compress(keep);
-                    ByteVector evens = hexNibs.rearrange(SHUFFLE_EVEN);
-                    ByteVector odds  = hexNibs.rearrange(SHUFFLE_ODD);
-                    ByteVector paired = evens.mul((byte) 16).or(odds);
-                    paired.intoArray(out, 0, SPECIES.indexInRange(0, 16));
+                    pairNibbles(hexNibs).intoArray(out, 0, SPECIES.indexInRange(0, 16));
                     return out;
                 }
                 // Mixed-span fast path: compress + expand(per-segment pad) + pair
-                // Replaces per-segment scalar extraction with vector compress+expand+pair
+                // Start compress early to overlap with scalar computeExpandMask
+                ByteVector hexNibs = r.compress(keep);
                 long expandBits = computeExpandMask(colonBits, len, nc, segs, pad);
                 if (expandBits == -1L) return null; // invalid span
-                ByteVector hexNibs = r.compress(keep);
                 ByteVector padded = hexNibs.expand(VectorMask.fromLong(SPECIES, expandBits));
-                ByteVector evens = padded.rearrange(SHUFFLE_EVEN);
-                ByteVector odds  = padded.rearrange(SHUFFLE_ODD);
-                ByteVector paired = evens.mul((byte) 16).or(odds);
-                paired.intoArray(out, 0, SPECIES.indexInRange(0, 16));
+                pairNibbles(padded).intoArray(out, 0, SPECIES.indexInRange(0, 16));
                 return out;
             }
 
             // Cold path: compress+expand+pair for :: without IPv4
             if (emptyCount > 0 && !hasDot) {
+                ByteVector hexNibs = r.compress(keep);
                 long expandBits = computeExpandMask(colonBits, len, nc, segs, pad);
                 if (expandBits != -1L) {
-                    ByteVector hexNibs = r.compress(keep);
                     ByteVector padded = hexNibs.expand(VectorMask.fromLong(SPECIES, expandBits));
-                    ByteVector evens = padded.rearrange(SHUFFLE_EVEN);
-                    ByteVector odds  = padded.rearrange(SHUFFLE_ODD);
-                    ByteVector paired = evens.mul((byte) 16).or(odds);
-                    paired.intoArray(out, 0, SPECIES.indexInRange(0, 16));
+                    pairNibbles(padded).intoArray(out, 0, SPECIES.indexInRange(0, 16));
                     return out;
                 }
             }
@@ -238,6 +231,19 @@ public class Ipv6ParserVector {
         }
 
         return out;
+    }
+
+    /** Pair adjacent nibble bytes into bytes using short-vector arithmetic.
+     *  Input: each byte holds a nibble (0-15), adjacent pairs form output bytes.
+     *  Uses reinterpret as shorts to combine pairs, then compress to pack.
+     *  Saves 1 port-5 rearrange vs even/odd approach. */
+    static ByteVector pairNibbles(ByteVector v) {
+        ShortVector sv = (ShortVector) v.reinterpretAsShorts();
+        ShortVector low = sv.and((short) 0xFF);
+        ShortVector high = (ShortVector) sv.lanewise(VectorOperators.LSHR, 8).and((short) 0xFF);
+        ShortVector paired = low.mul((short) 16).or(high);
+        ByteVector pairedBytes = (ByteVector) paired.reinterpretAsBytes();
+        return pairedBytes.compress(VectorMask.fromLong(SPECIES, 0x55555555L));
     }
 
     // -----------------------------------------------------------------
