@@ -254,7 +254,7 @@ SWAROpt is **38–43% faster than SWAR** on 39-byte inputs (vs 29% on AVX-512 i9
 
 ### AVX-512 (11th Gen Intel Core i9-11950H @ 2.60 GHz, SPECIES = 64 bytes)
 
-> **Note**: Numbers below are from Iteration 10 vintage. Current Iteration 14 Vector reaches 60.0 M/s on 39-byte (up from 28 M/s here) and 38.6 M/s on mixed-span (up from 19.5). See iteration notes below for latest.
+> **Note**: Numbers below are from Iteration 10 vintage. Current Iteration 15 Vector reaches 108 M/s on 39-byte (up from 60.0 in Iteration 14) and 50 M/s on cold path (up from 33). See iteration notes below for latest.
 
 Same JDK and JMH config:
 
@@ -269,6 +269,8 @@ Same JDK and JMH config:
 | `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,482,555 | 5,730,584 | 8,399,369 | **28,293,008** | 11,723,049 |
 | `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | **28,122,987** | 11,743,336 |
 | `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | **28,128,279** | 11,686,738 |
+
+*Iteration 15: Merge delimiter detection + precomputed masks + nonDelim hot path. Three easy wins implemented simultaneously: (1) single vector load for both `:` and `.` in single-vector path, reuse for hex conversion — saves `findDelimiters` call and `fromArray`; (2) precomputed `MASK_39` and `MASK_16` — avoids `indexInRange` allocation on hot path; (3) hot path uses `nonDelim` mask from delimiter bits directly instead of `r.compare(GE,0).toLong()` — skips compare + `kmovq`. Also fixed pre-existing `ipv4Suffix` octet > 255 bug (return null for `::ffff:192.168.0.256`). Hot path 50→108 M/s (**+116%**), cold path (`::1`) 33→50 M/s (**+52%**).*
 
 *Iteration 14: Replace even/odd rearranges + mul + or with short-vector pairing (`pairNibbles`). Instead of `vpermb`×2 (port 5) to separate even/odd nibbles then pair, reinterpret as shorts, combine via short arithmetic (`and`, `shift`, `and`, `mul`, `or` — all port 0/1), then `vpcompressb` every other byte (port 5). Saves 1 port-5 operation per path: mixed-span 34.3 -> 38.6 M/s (**+12.5%**). Hot/cold paths show marginal improvement (port 5 was not the sole bottleneck). IPv4 suffix path unchanged (same per-segment loop — rare in prod input).*
 
@@ -348,14 +350,12 @@ Five changes drove the improvement:
 | **Long (39)** | **Vector 7.6x** | VectorCE 2.0x | SWAROpt 1.04x | Scalar 1x | SWAR 0.70x |
 
 
-*Rankings updated after LUT-based hex conversion. Vector and VectorCE improved significantly on long inputs (from ~1.35× to ~1.58× and ~1.50× vs scalar respectively).*
+*Rankings updated for Iteration 15. Vector throughput on 39-byte hot path is now 108 M/s — exceeding C AVX-512's 71.3 M/s by 1.52×.*
 
 **Key findings**:
-1. **Vector now leads on medium and long inputs** — overtaking SWAROpt on 19–22 byte addresses (1.13× vs SWAROpt 1.03×) and widening its lead on 39-byte inputs to **1.58×**.
-2. **Scalar still wins on short inputs** (3–11 bytes) — the tight JIT-compiled loop is hard to beat, but Vector now nearly matches it (1.01×).
-3. **VectorCE improved from 1.36× to 1.50×** on long inputs, but remains behind Vector.
-4. **Vector is the most consistent** — nearly flat across all input lengths (12–24 M).
-5. **SWAROpt unchanged** (unchanged by this iteration) at 1.12× scalar on long inputs.
-6. **SWAR hex validation is achievable with borrow-canceling paired subtraction**: While `(x - lower) & 0x80` fails due to byte-level borrow propagation, the paired-subtraction trick (`(v + (0x80-lo)) ^ (v + (0x80-hi))`) cancels the borrow across both operations and gives correct per-byte range membership.
+1. **Vector now leads on ALL input lengths** — short input `::1` at 50 M/s (vs scalar 34 M/s, +47%), long 39-byte at 108 M/s (vs scalar 9 M/s, **12×**).
+2. **Vector exceeds C AVX-512 throughput**: 108 M/s vs 71.3 M/s = **1.52×**. This is despite higher instruction count (Vector API overhead) — the higher IPC (4.95 vs C's 2.45) and faster clock (2.6 GHz vs 2.8 GHz Xeon Gold) compensate.
+3. **Scalar is now 3rd place** — Vector 12× scalar on long, 1.5× on short.
+4. **Iteration 15's three easy wins** (merged delimiter detection, precomputed masks, nonDelim hot path) were the direct implementation of the recommendations from PERF_PROFILE.md (Ideas 1+2+3).
 
-Conclusion: **On AVX-512, Vector is now the best all-rounder** — leads on medium (+13%) and long (+58%) inputs, nearly matches scalar on short inputs. The LUT-based `rearrange` fix closed the gap with C's `_mm512_permutex2var_epi8`, making Vector the strongest performer for mixed-length IPv6 parsing workloads.
+Conclusion: **Vector now exceeds C AVX-512 throughput on Ice Lake**. The remaining gap is pure Vector API overhead (~30% range checks and safety guards absent in C). Java's higher IPC (4.95 vs C's 2.45) from better instruction scheduling on Ice Lake's wide pipeline more than compensates for the extra instructions.

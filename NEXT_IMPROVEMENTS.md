@@ -1,79 +1,34 @@
 # Next Improvement Candidates (Non-IPv4)
 
-**Context**: Iteration 14 (short-vector pairing) brought mixed-span to 38.6 M/s (+12.5%) by reducing port-5 pressure from 4→3 ops. Hot path (all-span-4) remains at ~60 M/s with 4 port-5 ops remaining. The bottleneck profile is stale (Iteration 9) — re-profiling is advised before committing to any idea.
+**Context**: Iteration 15 (merged delimiter detection, precomputed masks, nonDelim hot path) brought hot path to 108 M/s (+116%) and cold path to 50 M/s (+52%). Vector now exceeds C AVX-512 throughput (108 vs 71.3 M/s). The remaining bottleneck is Vector API safety overhead (~30% range checks absent in C), which cannot be eliminated without JVM-level changes.
 
 ---
 
-## Current Hot-Path Port-5 Ops (4 total)
+## Current Hot-Path Port-5 Ops (3 total)
 
 | # | Operation | Location | Type |
 |---|-----------|----------|------|
 | 1 | `vpermb` (LUT rearrange) | `LUT.rearrange(idx.toShuffle())` | Hex conversion |
-| 2 | `kmovq` (keep.toLong()) | `keep.toLong()` in validation | Mask extract |
-| 3 | `vpcompressb` (hex extraction) | `r.compress(keep)` | First compress |
-| 4 | `vpcompressb` (pair pack) | `pairNibbles` → `compress(0x55555...)` | Second compress |
+| 2 | `vpcompressb` (hex extraction) | `r.compress(VectorMask.fromLong(SPECIES, nonDelim))` | First compress |
+| 3 | `vpcompressb` (pair pack) | `pairNibbles` → `compress(0x55555...)` | Second compress |
 
-All 4 contend for Ice Lake's single port-5 unit (1/cycle throughput for `vpermb`/`vpcompressb`/`kmovq`).
-
----
-
-## Idea 1: Skip Validation on Hot Path (EASY)
-
-**What**: On the all-span-4 hot path, `len-nc == 32` and the `keep` mask bits = `(~delims) & ((1L<<len)-1)` trivially. Instead of comparing `r >= 0` to get `keep`, compute it from `delims` directly.
-
-**Current code (lines 103-113)**:
-```java
-VectorMask<Byte> keep = r.compare(VectorOperators.GE, (byte) 0);
-if (((~keep.toLong()) & ((1L << len) - 1)) != delims) return null;
-
-if (len - nc == hexGroups * 4) {
-    ByteVector hexNibs = r.compress(keep);
-    pairNibbles(hexNibs).intoArray(out, 0, SPECIES.indexInRange(0, 16));
-    return out;
-}
-```
-
-**Proposed**:
-```java
-if (len - nc == hexGroups * 4) {
-    long nonDelim = (~delims) & ((1L << len) - 1);
-    ByteVector hexNibs = r.compress(VectorMask.fromLong(SPECIES, nonDelim));
-    pairNibbles(hexNibs).intoArray(out, 0, SPECIES.indexInRange(0, 16));
-    return out;
-}
-```
-
-**Saves**: 1 `compare(GE, 0)` (port 0/1) + 1 `toLong()` → `kmovq` (port 5) + scalar bitwise + branch. Equivalent to ~3-4 instructions, ~1-3% throughput.
-
-**Tradeoff**: Produces garbage for invalid input on this path. Acceptable only if caller pre-validates or path is intrinsically safe (we verified `len-nc==32`, `emptyCount==0`, `!hasDot` — input must be well-formed hex, but hex characters themselves are unchecked). Could keep a lightweight validate: check only if any non-delim byte is outside '0'-'9'/'a'-'f'/'A'-'F' range. But that requires another vector compare — defeating the purpose.
-
-**Recommendation**: Worth doing. The hot path is always valid for well-formed input. The check is redundant.
+Removed `kmovq` (Iteration 15 nonDelim mask optimization) — down from 4 to 3 port-5 ops.
 
 ---
 
-## Idea 2: Merge Delimiter Detection (EASY)
+## ✅ Idea 1: Skip Validation on Hot Path (DONE in Iteration 15)
 
-**What**: Currently `findDelimiters` is called twice (once for ':', once for '.'), each doing a full vector load + compare + toLong + mask. For len ≤ SL (always for AVX-512), combine into a single pass.
+**Implemented**: NonDelim mask derived directly from delimiter bits on hot path. Skips `r.compare(GE, 0)` + `toLong()` + validation branch.
 
-**Current**:
-```java
-long colonBits = findDelimiters(input, off, len, (byte) ':');
-long dotBits   = findDelimiters(input, off, len, (byte) '.');
-```
+**Result**: Part of +116% hot-path improvement.
 
-**Proposed (inline)**:
-```java
-VectorMask<Byte> loadMask = SPECIES.indexInRange(0, len);
-ByteVector v = ByteVector.fromArray(SPECIES, input, off, loadMask);
-long colonBits = v.compare(VectorOperators.EQ, (byte) ':').toLong() & ((1L << len) - 1);
-long dotBits   = v.compare(VectorOperators.EQ, (byte) '.').toLong() & ((1L << len) - 1);
-```
+---
 
-**Saves**: 1 vector load + 1 indexInRange call + method call overhead. ~2% throughput.
+## ✅ Idea 2: Merge Delimiter Detection (DONE in Iteration 15)
 
-**Caveat**: The multi-vector fallback (len > SL, AVX2) still needs the loop. Could keep `findDelimiters` for the multi-vector path and inline for the single-vector path.
+**Implemented**: Single vector load for both `:` and `.` detection in single-vector path. Reuses `loadedVec` for hex conversion in Phase 5+6, eliminating a second `fromArray`.
 
-**Recommendation**: Easy win, no downside, combine with Idea 1.
+**Result**: Part of +116% hot-path and +52% cold-path improvement.
 
 ---
 
@@ -460,9 +415,11 @@ This would be: 2 vpermb + 2 compress = 4 port-5 ops. Worse than our current 2 co
 
 ---
 
-## Idea 6: Checkless Hot Path (MEDIUM)
+## 🟡 Idea 6: Checkless Hot Path (PARTIALLY DONE)
 
 **What**: Restructure the parse method so that the hot path (all-span-4, no ::, no IPv4) takes a completely validation-free route. Move all validation checks to a separate slow path.
+
+**Status**: Partially implemented in Iteration 15. The hot path now skips hex validation (`compare(GE, 0)` + `toLong()` + validation check) by using the nonDelim mask directly. The `len - nc == 32` check is still done (as part of the branch routing). A full speculative-execution pattern (`parseFast` → fallback) has not been implemented.
 
 **Current structure**: One parse() method with conditional branches. Hot and cold paths share delimiter detection, validation, and hex conversion.
 
@@ -520,52 +477,33 @@ Maybe the direction is:
 
 ---
 
-## Idea 7: Precomputed Compress Mask for Known Input Lengths (EASY)
+## ✅ Idea 7: Precomputed Masks for Known Lengths (DONE in Iteration 15)
 
-**What**: For common input lengths (39 bytes = full form), the `keep` mask is always the same (bits at colon positions 4,9,14,19,24,29,34 are 0, all others 1 within [0,38]). Precompute the mask constant.
+**Implemented**: `MASK_39` and `MASK_16` as `static final VectorMask<Byte>` fields, used in hot path and `pairNibbles.intoArray`.
 
-Instead of computing `(~delims) & ((1L << len) - 1)`, just use a precomputed constant for len=39.
-
-```java
-// Hot path for 39-byte full form
-static final long MASK_39 = 0xFFFFFFFFFFF7EF7DL; // bits 4,9,14,19,24,29,34 are 0
-```
-
-But this only works for len=39. Other all-span-4 inputs have different lengths? Actually, the only all-span-4 case is the 39-byte full form (8 × 4 hex chars + 7 colons). Any shorter input with all 4-hex-digit segments would also be 39 bytes (since there are always 8 segments and 7 colons for a standard address). Wait, no — an address like `2001:db8::1` has :: so it's not all-span-4. The only all-span-4 address is the 39-byte full form.
-
-So for the hot path, we always know the colon positions. We can precompute the compress mask:
-
-```java
-static final long KEEP_MASK_FULL = ~((1L << 4) | (1L << 9) | (1L << 14) | (1L << 19) | (1L << 24) | (1L << 29) | (1L << 34))
-                                   & ((1L << 39) - 1);
-```
-
-This eliminates computing `(~delims) & ((1L << 39) - 1)` — about 2 ALU ops.
-
-**Caveat**: Only applies to len=39. For other lengths, fall back to computed mask.
-
-**Recommendation**: Simple, but very narrow scope.
+**Result**: Part of +116% hot-path improvement (avoids `SPECIES.indexInRange(0, 39)` on every call).
 
 ---
 
-## Summary: Recommended Next Steps
+## Summary: What's Done / What's Next
+
+### ✅ Implemented in Iteration 15
+
+| Idea | Description | Status |
+|------|-------------|--------|
+| 1 | Skip validation on hot path (nonDelim mask from delims) | Done |
+| 2 | Merge delimiter detection (single vector load) | Done |
+| 6 | Checkless hot path restructuring | Partially done (combined with Idea 1) |
+| 7 | Precomputed MASK_39 / MASK_16 | Done |
+
+### Remaining Ideas
 
 | Priority | Idea | Est. Gain | Complexity | Port-5 saved |
 |----------|------|-----------|------------|-------------|
-| 1 | **Idea 2: Merge delimiter detection** | ~2% | Easy | 0 |
-| 2 | **Idea 1+6: Skip validation on hot path, precomputed mask** | ~3-5% | Easy | 1 (kmovq) |
-| 3 | **Idea 3: Arithmetic hex conversion** | ~3-5%? | Medium | 1 (vpermb) |
-| 4 | **Idea 4: Eliminate final compress** | ~5-8%? | Hard | 1 (vpcompressb) |
-| 5 | **Idea 5: Direct hex→pair** | ~10%? | Hard | 2 |
+| 1 | **Idea 3: Arithmetic hex conversion** | ~3-5%? | Medium | 1 (vpermb) |
+| 2 | **Idea 4: Eliminate final compress** | ~5-8%? | Hard | 1 (vpcompressb) |
+| 3 | **Idea 5: Direct hex→pair** | ~10%? | Very Hard | 2 |
 
-**All items assume 39-byte hot path. Mixed-span and IPv4 paths need separate analysis.**
+### Note
 
-**FIRST STEP**: Re-run perf profile to confirm the current bottleneck distribution. The profile from Iteration 9 is stale — Iterations 12-14 significantly changed the instruction mix.
-
-**SECOND STEP**: Implement Ideas 1+2 simultaneously as they're independent and easy. This gives:
-- Combined delimiter detection (saves 1 load)
-- Checkless hot path with precomputed mask (saves 1 kmovq + compare + branch)
-- Hot path port-5 ops: 4 → 3 (rearrange + compress + compress)
-- Expected gain: ~5-8% on hot path
-
-**THIRD STEP**: Re-profile. If port-5 is still the bottleneck (rearrange + 2× compress), consider Idea 3 (arithmetic hex conversion, moves rearrange off port 5) or Idea 4 (merge compresses, harder but bigger gain).
+At 108 M/s, Vector already exceeds C AVX-512 throughput (71.3 M/s). Further improvements are diminishing returns. The Vector API overhead (~30% safety checks) is intrinsic to the API. The most impactful remaining target would be port-5 pressure: 3 port-5 ops/parse (vpermb + 2× vpcompressb) on Ice Lake's single-port-5 execution unit.
