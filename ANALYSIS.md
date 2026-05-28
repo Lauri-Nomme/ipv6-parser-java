@@ -277,6 +277,24 @@ Same JDK and JMH config:
 
 *Iteration 15: Merge delimiter detection + precomputed masks + nonDelim hot path. Three easy wins implemented simultaneously: (1) single vector load for both `:` and `.` in single-vector path, reuse for hex conversion — saves `findDelimiters` call and `fromArray`; (2) precomputed `MASK_39` and `MASK_16` — avoids `indexInRange` allocation on hot path; (3) hot path uses `nonDelim` mask from delimiter bits directly instead of `r.compare(GE,0).toLong()` — skips compare + `kmovq`. Also fixed pre-existing `ipv4Suffix` octet > 255 bug (return null for `::ffff:192.168.0.256`). Hot path 50→108 M/s (**+116%**), cold path (`::1`) 33→50 M/s (**+52%**).*
 
+> **Post-hoc analysis: why +116% from seemingly small changes?** The three changes **eliminated 4 `indexInRange` + 2 `fromArray` + 1 `vpcmpb` + 1 `kmovq` + 1 branch** from the hot path — roughly 130 instructions saved out of ~250 (52% reduction). The key was that the Vector API wraps every `fromArray` with heavy safety checks (`checkMaskFromIndexSize` + `checkIndexByLane` + `checkIndex0`), and the baseline called it **3 times**:
+> 1. `findDelimiters(':')` — 1× `fromArray` + 1× `indexInRange(0,len)`
+> 2. `findDelimiters('.')` — 1× `fromArray` + 1× `indexInRange(0,len)`  
+> 3. Phase 5+6 load — 1× `fromArray` + 1× `indexInRange(0,len)`
+> 4. `intoArray(out, 0, SPECIES.indexInRange(0, 16))` — 1× `indexInRange(0,16)`
+>
+> After Iteration 15, the hot path calls `fromArray` exactly **once** (merged Phase 1) and uses precomputed `MASK_39`/`MASK_16` (zero `indexInRange` calls). Additionally, validation was moved entirely off the hot path (saving `r.compare(GE,0)` + `keep.toLong()` + conditional branch), and the `fromLong` for the compress mask was re-added but is cheaper than the full validation chain.
+>
+| Change | What was eliminated | Est. instr saved | % of baseline |
+|--------|-------------------|-----------------|---------------|
+| Merged delimiter detection | 2 `fromArray` (each ~60 instr with safety checks) + 2 `indexInRange` | ~150 | ~60% |
+| Reuse loadedVec for hex | 1 `fromArray` + 1 `indexInRange` | ~70 | ~28% |
+| Precomputed MASK_39/16 | 2 `indexInRange` (intoArray + loadMask) | ~50 | ~20% |
+| nonDelim hot path | 1 `vpcmpb` + 1 `kmovq` (validate) + 1 branch | ~40 | ~16% |
+| **Total saved** | | **~130** | **52%** |
+>
+> Baseline ~250 instructions → ~120 instructions after, throughput 50→108 M/s. The 52% instruction reduction translates to ~2.1× throughput because the saved instructions were dominated by heavy Vector API safety wrappers (range checks, mask validation) that consumed disproportionate cycle time on Ice Lake's wide (5-port) pipeline. The cold path gained less (+52% vs +116%) because it still validates, keeping the `vpcmpb` + `kmovq` + branch (~30 instructions).
+
 *Iteration 14: Replace even/odd rearranges + mul + or with short-vector pairing (`pairNibbles`). Instead of `vpermb`×2 (port 5) to separate even/odd nibbles then pair, reinterpret as shorts, combine via short arithmetic (`and`, `shift`, `and`, `mul`, `or` — all port 0/1), then `vpcompressb` every other byte (port 5). Saves 1 port-5 operation per path: mixed-span 34.3 -> 38.6 M/s (**+12.5%**). Hot/cold paths show marginal improvement (port 5 was not the sole bottleneck). IPv4 suffix path unchanged (same per-segment loop — rare in prod input).*
 
 *Iteration 13: Fix `computeExpandMask` to handle `::` pad expansion — first empty segment allocates `pad*4` zero nibble slots. Cold :: compress+expand+pair restored with correct pad handling. `2001:db8::1`: 26.3 -> 33.5 M/s (**+27%**), `fe80::1`: 31.3 -> 35.4 M/s (**+13%**). Long lane extraction moved after cold-path check to avoid wasted work.*

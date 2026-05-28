@@ -19,6 +19,15 @@
 | Branches | ~13 | ~40 |
 | Branch misses | ~0 | ~0 |
 
+### Why Iteration 15 was +116% despite "just" three small changes
+
+The three Iteration 15 changes eliminated **4 `indexInRange` + 2 `fromArray` + 1 `vpcmpb` + 1 `kmovq` + 1 branch** from the hot path:
+- **`findDelimiters` called `fromArray` TWICE** (once per delimiter), each triggering the full Vector API safety chain (~60 instr/call)
+- **Phase 5+6 called `fromArray` a THIRD time** — reused `loadedVec` instead
+- **Precomputed MASK_39/16** eliminated all 4 `indexInRange` calls from the hot path (zero runtime mask creation)
+- **nonDelim mask** eliminated validation (`vpcmpb` + `kmovq`) from hot path
+- **Total**: ~130 of ~250 baseline instructions removed (~52% reduction), translating to 50→108 M/s
+
 ### What Changed vs Iteration 15
 
 | Optimization | Iteration | Impact |

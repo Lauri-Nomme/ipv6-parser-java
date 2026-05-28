@@ -22,6 +22,7 @@
 - Bug fix: `ipv4Suffix` now validates octets > 255 (returns null for `::ffff:192.168.0.256`)
 - Added `junit-jupiter-params` dependency for `@MethodSource` tests
 - **Result**: 50→108 M/s (+116%) on hot path 39-byte full form (`2001:0db8:0000:0000:0000:0000:0000:0001`)
+- **Why +116%**: Removed ~130 of ~250 baseline hot-path instructions (~52%). The Vector API wraps every `fromArray` in a heavy safety chain (`checkMaskFromIndexSize` + `checkIndexByLane` + `checkIndex0`), and the baseline called `fromArray` **3 times** (2× `findDelimiters` + 1× Phase 5+6). After Iteration 15: **1 call** (merged Phase 1). Combined with 4 eliminated `indexInRange` calls (precomputed MASK_39/16) and validation moved off hot path (saves `compare(GE,0)` + `toLong()` + branch).
 
 ### Iteration 14 (`af511f0`)
 - Profiled hot path on precision (i9-11950H): IPC 4.95, 371 inst/op, 75 cyc/op, 61.8 M/s
