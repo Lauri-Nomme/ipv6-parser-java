@@ -114,20 +114,19 @@ public class Ipv6ParserVector {
         if (len <= SL) {
             // Single-vector fast path: reuse cached vector from Phase 1
             ByteVector v = loadedVec;
-            VectorMask<Byte> isHi = v.compare(VectorOperators.GE, (byte) 64);
-            ByteVector idx = v.blend(v.sub((byte) 64), isHi);
-            ByteVector r = LUT.rearrange(idx.toShuffle());
 
             if (emptyCount == 0 && !hasDot) {
-                // Hot path: all hex segments, no ::, no IPv4
+                // Hot path: all hex segments, no ::, no IPv4 — arithmetic hex (no vpermb)
                 if (len - nc == hexGroups * 4) {
                     // All segments span exactly 4 chars — vector compress+pair
-                    // Use precomputed mask — no fromLong/kmovq, no validation
+                    // No validation needed (preconditions guarantee well-formed input)
+                    ByteVector r = hexNibblesArithmetic(v);
                     ByteVector hexNibs = r.compress(HOT_COMPRESS_MASK);
                     pairNibbles(hexNibs).intoArray(out, 0, MASK_16);
                     return out;
                 }
                 // Mixed-span fast path: compress + expand(per-segment pad) + pair
+                ByteVector r = hexNibblesArithmetic(v);
                 long nonDelim = (~delims) & ((1L << len) - 1);
                 ByteVector hexNibs = r.compress(VectorMask.fromLong(SPECIES, nonDelim));
                 long expandBits = computeExpandMask(colonBits, len, nc, segs, pad);
@@ -137,7 +136,8 @@ public class Ipv6ParserVector {
                 return out;
             }
 
-            // Cold path or IPv4: validate hex conversion first
+            // Cold path or IPv4: LUT-based hex (validates via -1 sentinel)
+            ByteVector r = hexNibblesLUT(v);
             long nonDelim = (~delims) & ((1L << len) - 1);
             VectorMask<Byte> keep = r.compare(VectorOperators.GE, (byte) 0);
             if (((~keep.toLong()) & ((1L << len) - 1)) != delims) return null;
@@ -263,6 +263,25 @@ public class Ipv6ParserVector {
         ShortVector paired = low.mul((short) 16).or(high);
         ByteVector pairedBytes = (ByteVector) paired.reinterpretAsBytes();
         return pairedBytes.compress(PAIR_MASK);
+    }
+
+    /** Arithmetic-only hex-to-nibble conversion (no vpermb).
+     *  Maps '0'-'9' → 0-9, 'A'-'F' → 10-15, 'a'-'f' → 10-15.
+     *  Non-hex chars may produce arbitrary 0-15 values — no validation!
+     *  For hot-path use only where input is known well-formed. */
+    static ByteVector hexNibblesArithmetic(ByteVector v) {
+        ByteVector nibble = v.and((byte) 0x0F);
+        VectorMask<Byte> isLetter = v.compare(VectorOperators.GE, (byte) 'A');
+        ByteVector letterVal = nibble.add((byte) 9);
+        return nibble.blend(letterVal, isLetter);
+    }
+
+    /** LUT-based hex-to-nibble conversion (uses vpermb).
+     *  Maps invalid hex chars to -1 for detection by caller. */
+    static ByteVector hexNibblesLUT(ByteVector v) {
+        VectorMask<Byte> isHi = v.compare(VectorOperators.GE, (byte) 64);
+        ByteVector idx = v.blend(v.sub((byte) 64), isHi);
+        return LUT.rearrange(idx.toShuffle());
     }
 
     // -----------------------------------------------------------------
