@@ -19,6 +19,9 @@ public class Ipv6ParserVector {
     // Shuffles for pairing 32 contiguous nibbles into 16 bytes
     static final VectorShuffle<Byte> SHUFFLE_EVEN;
     static final VectorShuffle<Byte> SHUFFLE_ODD;
+    // Precomputed masks for common sizes (avoid indexInRange computation)
+    static final VectorMask<Byte> MASK_39 = SPECIES.indexInRange(0, 39);
+    static final VectorMask<Byte> MASK_16 = SPECIES.indexInRange(0, 16);
     // reusable buffer for hex nibble output (single-threaded use)
     static final byte[] HEX_BUF = new byte[45];
 
@@ -47,8 +50,19 @@ public class Ipv6ParserVector {
         if (len < 2 || len > 45) return null;
 
         // ---- Phase 1: vectorized delimiter detection -----------------
-        long colonBits = findDelimiters(input, off, len, (byte) ':');
-        long dotBits   = findDelimiters(input, off, len, (byte) '.');
+        // For single-vector case, load once and reuse for hex conversion
+        long colonBits, dotBits;
+        ByteVector loadedVec = null;
+        if (len <= SL) {
+            VectorMask<Byte> loadMask = len == 39 ? MASK_39 : SPECIES.indexInRange(0, len);
+            loadedVec = ByteVector.fromArray(SPECIES, input, off, loadMask);
+            long m = (1L << len) - 1;
+            colonBits = loadedVec.compare(VectorOperators.EQ, (byte) ':').toLong() & m;
+            dotBits   = loadedVec.compare(VectorOperators.EQ, (byte) '.').toLong() & m;
+        } else {
+            colonBits = findDelimiters(input, off, len, (byte) ':');
+            dotBits   = findDelimiters(input, off, len, (byte) '.');
+        }
 
         int nc = Long.bitCount(colonBits);
         if (nc == 0) return null;
@@ -91,44 +105,43 @@ public class Ipv6ParserVector {
         // ---- Phase 5+6: validate, convert & assemble output ----------
         byte[] out = new byte[16];
         long delims = colonBits | dotBits;
+        long nonDelim = (~delims) & ((1L << len) - 1);
 
         if (len <= SL) {
-            // Single-vector fast path: keep nibbles in register longs
-            VectorMask<Byte> lm = SPECIES.indexInRange(0, len);
-            ByteVector v = ByteVector.fromArray(SPECIES, input, off, lm);
+            // Single-vector fast path: reuse cached vector from Phase 1
+            ByteVector v = loadedVec;
             VectorMask<Byte> isHi = v.compare(VectorOperators.GE, (byte) 64);
             ByteVector idx = v.blend(v.sub((byte) 64), isHi);
             ByteVector r = LUT.rearrange(idx.toShuffle());
 
-            VectorMask<Byte> keep = r.compare(VectorOperators.GE, (byte) 0);
-            if (((~keep.toLong()) & ((1L << len) - 1)) != delims) return null;
-
             if (emptyCount == 0 && !hasDot) {
                 // Hot path: all hex segments, no ::, no IPv4
-                // len - nc = hex chars (no dots on this path), avoids popcnt
                 if (len - nc == hexGroups * 4) {
                     // All segments span exactly 4 chars — vector compress+pair
-                    ByteVector hexNibs = r.compress(keep);
-                    pairNibbles(hexNibs).intoArray(out, 0, SPECIES.indexInRange(0, 16));
+                    // Use precomputed nonDelim mask — skips validation (safe on hot path)
+                    ByteVector hexNibs = r.compress(VectorMask.fromLong(SPECIES, nonDelim));
+                    pairNibbles(hexNibs).intoArray(out, 0, MASK_16);
                     return out;
                 }
                 // Mixed-span fast path: compress + expand(per-segment pad) + pair
-                // Start compress early to overlap with scalar computeExpandMask
-                ByteVector hexNibs = r.compress(keep);
+                ByteVector hexNibs = r.compress(VectorMask.fromLong(SPECIES, nonDelim));
                 long expandBits = computeExpandMask(colonBits, len, nc, segs, pad);
                 if (expandBits == -1L) return null; // invalid span
                 ByteVector padded = hexNibs.expand(VectorMask.fromLong(SPECIES, expandBits));
-                pairNibbles(padded).intoArray(out, 0, SPECIES.indexInRange(0, 16));
+                pairNibbles(padded).intoArray(out, 0, MASK_16);
                 return out;
             }
 
-            // Cold path: compress+expand+pair for :: without IPv4
+            // Cold path or IPv4: validate hex conversion first
+            VectorMask<Byte> keep = r.compare(VectorOperators.GE, (byte) 0);
+            if (((~keep.toLong()) & ((1L << len) - 1)) != delims) return null;
+
             if (emptyCount > 0 && !hasDot) {
                 ByteVector hexNibs = r.compress(keep);
                 long expandBits = computeExpandMask(colonBits, len, nc, segs, pad);
                 if (expandBits != -1L) {
                     ByteVector padded = hexNibs.expand(VectorMask.fromLong(SPECIES, expandBits));
-                    pairNibbles(padded).intoArray(out, 0, SPECIES.indexInRange(0, 16));
+                    pairNibbles(padded).intoArray(out, 0, MASK_16);
                     return out;
                 }
             }
@@ -194,7 +207,7 @@ public class Ipv6ParserVector {
                     out[oi++] = (byte)hexVal;
                 } else {
                     if (dotCount != 3) return null;
-                    ipv4Suffix(input, off + start, end - start, out, oi);
+                    if (!ipv4Suffix(input, off + start, end - start, out, oi)) return null;
                     oi += 4;
                 }
             }
@@ -224,7 +237,7 @@ public class Ipv6ParserVector {
                     out[oi++] = (byte)v;
                 } else {
                     if (dotCount != 3) return null;
-                    ipv4Suffix(input, off + start, end - start, out, oi);
+                    if (!ipv4Suffix(input, off + start, end - start, out, oi)) return null;
                     oi += 4;
                 }
             }
@@ -338,7 +351,7 @@ public class Ipv6ParserVector {
         }
     }
 
-    static void ipv4Suffix(byte[] b, int off, int len, byte[] out, int oi) {
+    static boolean ipv4Suffix(byte[] b, int off, int len, byte[] out, int oi) {
         int[] dotPos = new int[3];
         int di = 0;
         for (int i = 0; i < len; i++) if (b[off + i] == '.') dotPos[di++] = i;
@@ -348,8 +361,10 @@ public class Ipv6ParserVector {
             int v = 0;
             for (int j = prev; j < segEnds[oct]; j++)
                 v = v * 10 + (b[off + j] - '0');
+            if (v > 255) return false;
             out[oi + oct] = (byte)v;
             prev = segEnds[oct] + 1;
         }
+        return true;
     }
 }
