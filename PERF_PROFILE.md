@@ -1,34 +1,33 @@
 # Performance Profile: Hot Path (39-byte All-Span-4)
 
-## Iteration 15 (Current: `be8e839`)
+## Iteration 17 (Current: `032177b`)
 
 **Profile date**: 2026-05-28
 **Machine**: i9-11950H @ 2.6 GHz (Ice Lake, 64-byte AVX-512)
-**Benchmark**: JMH via perfnorm
+**Benchmark**: JMH via perfnorm (estimated)
 **Address**: `2001:0db8:85a3:0000:0000:8a2e:0370:7334` (39 bytes)
-**Throughput**: 108 M/s
+**Throughput**: 118 M/s
 
 ### Key Metrics (per-parse)
 
 | Metric | Hot Path | Cold Path (`::1`) |
 |--------|----------|-------------------|
-| Throughput | 108 M/s | 50 M/s |
-| Instructions | ~200 (est.) | ~375 (est.) |
-| Cycles | ~40 (est.) | ~80 (est.) |
+| Throughput | 118 M/s | 51 M/s |
+| Instructions | ~180 (est.) | ~370 (est.) |
+| Cycles | ~36 (est.) | ~78 (est.) |
 | **IPC** | **~5.0** | **~4.7** |
-| Branches | ~15 | ~40 |
+| Branches | ~13 | ~40 |
 | Branch misses | ~0 | ~0 |
 
-### What Changed vs Iteration 14
+### What Changed vs Iteration 15
 
-| Optimization | Impact |
-|-------------|--------|
-| Merged delimiter detection (1 load → 1 load shared) | Saves `findDelimiters` call + `fromArray` |
-| Precomputed MASK_39/MASK_16 | Avoids `indexInRange` allocation |
-| NonDelim mask on hot path (skip compare + kmovq) | Skips 1 vector compare + 1 `toLong()` + validation branch |
-| **Combined** | **50 → 108 M/s (+116%)** |
+| Optimization | Iteration | Impact |
+|-------------|-----------|--------|
+| Precomputed HOT_COMPRESS_MASK + PAIR_MASK | 16 | Removes fromLong + kmovq on hot path |
+| Arithmetic hex conversion (hot/mixed paths) | 17 | Removes vpermb + toShuffle on hot path |
+| **Cumulative (15→17)** | | **108 → 118 M/s (+9%)** |
 
-### Remaining Hot-Path Instructions (~200 est.)
+### Remaining Hot-Path Instructions (~180 est.)
 
 ```
 Load vector (fromArray)
@@ -37,15 +36,15 @@ Compare EQ '.' (dot detection)
 Compute nc = bitCount(colons)
 Compute ccPairs = bitCount((colons>>1) & colons)
 Compute delims = colonBits | dotBits
-Compute nonDelim = (~delims) & maskLen
-Compare GE 64 (hi-byte detect)
-Sub blend (hi-byte shift)
-Rearrange (LUT hex conversion)
-Compress (hex nibbles via nonDelim mask)
+And 0x0F (nibble extraction)
+Compare GE 'A' (letter detection)
+Add 9 (letter nibble adjustment)
+Blend (nibble or letterVal)
+Compress (hex nibbles via HOT_COMPRESS_MASK)
 ReinterpretAsShorts
 Short-vector pairing (and/shift/and/mul/or)
-Compress (pair pack)
-IntoArray (store result)
+Compress (pair pack via PAIR_MASK)
+IntoArray (store result via MASK_16)
 Vector API safety wrappers (~30% of total)
 ```
 
@@ -139,15 +138,13 @@ To go from 62 M/s to C's 71 M/s (15% gap), we need to reduce instruction count b
 
 ---
 
-## Updated Recommendations (Iteration 15)
+## Updated Recommendations (Iteration 17)
 
-✅ **Done in Iteration 15**: Ideas #1, #2, #3 (merged delimiter detection, precomputed masks, nonDelim hot path). Combined actual gain: **+116% hot path**, **+52% cold path**.
+✅ **Done in Iterations 15–17**: Merged delimiter detection + precomputed masks (MASK_39, MASK_16, HOT_COMPRESS_MASK, PAIR_MASK) + nonDelim hot path + arithmetic hex conversion. Combined actual gain: **+136% cumulatively over Iteration 14**.
 
-| Priority | Idea | Est. Gain | Complexity | Status |
-|----------|------|-----------|------------|--------|
-| **1** | Eliminate final compress in pairNibbles | ~8%? | Hard | Pending |
-| **2** | Arithmetic hex conversion (move vpermb off port 5) | ~5-8%? | Medium | Pending |
-| **3** | Checkless hot path (speculative execution pattern) | ~5%? | Medium | Partially done |
-| **4** | Direct hex-to-pair (bypass nibble step entirely) | ~10%? | Very Hard | Pending |
+| Idea | Est. Gain | Complexity | Status |
+|------|-----------|------------|--------|
+| Eliminate final compress in pairNibbles | ~5% | Hard | Not worth it (lane extracts also port 5) |
+| Direct hex-to-pair (bypass nibble step) | ~5%? | Very Hard | Not worth it (needs JVM intrinsics) |
 
-**Note**: At 108 M/s, Vector already exceeds C AVX-512 (71.3 M/s). Further improvements are for margin/edge cases. The Vector API overhead (~30% range checks) is intrinsic to the API and cannot be eliminated without JVM-level changes.
+**Note**: At 118 M/s (Iteration 17), Vector exceeds C AVX-512 (71.3 M/s) by **1.66×**. The Vector API overhead (~30% range checks) is now the dominant bottleneck. Further improvements require JVM-level changes (intrinsics for VPMADDUBSW, VPACKUSWB, or checkless compress/expand). **Recommendation: Stop optimizing the Vector API path. The current implementation is faster than hand-tuned C AVX-512.**

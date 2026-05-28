@@ -2,7 +2,19 @@
 
 ## Recent Iterations
 
-### Iteration 15 (current HEAD: `be8e839`)
+### Iteration 17 (current HEAD: `032177b`)
+- **Arithmetic hex conversion** on hot/mixed paths: replaces LUT `vpermb` (port 5) with `vpandb`+`vpaddb`+`vpcmpb`+`vpblendmb` (1 port 5)
+  - `hexNibblesArithmetic`: `v.and(0x0F)` → nibble, `v.compare(GE,'A')` → letter mask, `nibble + 9` → letter value
+  - Hybrid: arithmetic on hot/mixed (no validation needed), LUT kept for cold path (needs -1 sentinel for validate)
+- **Result**: Hot path 112.0→118.4 M/s (**+5.7%**), cold path 51.2 M/s (unchanged)
+
+### Iteration 16 (`7391abc`)
+- **Precomputed `HOT_COMPRESS_MASK`**: 39-byte nonDelim precomputed (colon positions fixed: 4,9,14,19,24,29,34)
+- **Precomputed `PAIR_MASK`**: `VectorMask.fromLong(SPECIES, 0x55555555L)` for pairNibbles compress
+- **Deferred `nonDelim` computation** to mixed-span/cold paths only
+- **Result**: Hot path 108.2→112.0 M/s (**+3.5%**), cold path 51.8 M/s (unchanged)
+
+### Iteration 15 (`be8e839`)
 - Three optimizations to `Ipv6ParserVector.java`:
   1. **Merged delimiter detection**: Single vector load for both `':'` and `'.'` detection in single-vector path; reuses loaded vector for hex conversion (eliminates redundant `findDelimiters` calls and duplicate `fromArray`)
   2. **Precomputed MASK_39 and MASK_16**: Static final fields replacing `SPECIES.indexInRange(0, 39/16)` — avoids allocation + computation on hot path
@@ -45,7 +57,15 @@ mvn test -q
 ```
 
 ## Performance (precision: i9-11950H @ 2.6 GHz)
-| Version | Hot path | ::1 (cold) | Note |
-|---------|----------|-----------|------|
+| Version | Hot path | ::1 (cold) | Cumulative gain |
+|---------|----------|-----------|----------|
 | Iteration 14 | 50 M/s | 33 M/s | Baseline |
 | Iteration 15 | 108 M/s | 50 M/s | +116% hot / +52% cold |
+| Iteration 16 | 112 M/s | 52 M/s | +3.5% hot |
+| **Iteration 17** | **118 M/s** | **51 M/s** | **+136% from baseline** |
+
+## Key Design Decisions
+- `hexNibblesArithmetic` for hot/mixed paths, `hexNibblesLUT` for cold path (validation)
+- `HOT_COMPRESS_MASK` precomputed for 39-byte (colon positions fixed at 4,9,14,19,24,29,34)
+- `PAIR_MASK` = 0x55555555L, selects even byte lanes for compress after short-vector pairing
+- LUT still needed for cold path (-1 sentinel for GE 0 validation)

@@ -122,11 +122,12 @@ The [`Ipv6ParserVector.java`](src/main/java/ipv6parse/Ipv6ParserVector.java) cla
 |---|---|---|
 | Colon detection | `_mm512_cmpeq_epu8_mask` → 64-bit bitmask | `ByteVector::compare(EQ, ':')` → `toLong()` |
 | Dot detection | same approach | same approach |
-| Hex conversion | `_mm512_permutex2var_epi8` lookup table | single-LUT `rearrange` (shift+blend + `vpermb`) |
-| Compress/expand | `maskz_compress/expand_epi8` | **not available** → scalar fallback |
-| Group assembly | `_mm256_maddubs_epi16` → `cvtepi16_epi8` | **not available** → scalar shift-accumulate |
+| Hex conversion | `_mm512_permutex2var_epi8` lookup table | arithmetic on hot path (`and`+`add`+`compare`+`blend`), LUT `rearrange` on cold path |
+| Compress | `_mm512_maskz_compress_epi8` | `ByteVector::compress` (JDK 20+) |
+| Expand | `_mm512_maskz_expand_epi8` | `ByteVector::expand` (JDK 20+) |
+| Group assembly | `_mm256_maddubs_epi16` → `cvtepi16_epi8` | short-vector arithmetic (and+shift+mul+or) + `compress` |
 
-The Vector API has no equivalent of the x86 `compress`/`expand` instructions, which are the heart of Lemire's approach. The hex conversion can be vectorized (using `sub` + range-check masks + `blend`), but the results must still be extracted group-by-group via scalar code.
+The Vector API provides `compress`/`expand` since JDK 20, mapping to `vpcompressb`/`vpexpandb`. The missing instructions are `_mm256_maddubs_epi16` (multiply-accumulate bytes to shorts) and `vpackuswb` (pack shorts to bytes), both unavailable in the Vector API. The Java code substitutes short-vector arithmetic for multiply-accumulate and `vpcompressb` for pack.
 
 ## SWAR Implementation (4th variant)
 
@@ -254,7 +255,7 @@ SWAROpt is **38–43% faster than SWAR** on 39-byte inputs (vs 29% on AVX-512 i9
 
 ### AVX-512 (11th Gen Intel Core i9-11950H @ 2.60 GHz, SPECIES = 64 bytes)
 
-> **Note**: Numbers below are from Iteration 10 vintage. Current Iteration 15 Vector reaches 108 M/s on 39-byte (up from 60.0 in Iteration 14) and 50 M/s on cold path (up from 33). See iteration notes below for latest.
+> **Note**: Numbers below are from Iteration 10 vintage. Current Iteration 17 Vector reaches 118 M/s on 39-byte (up from 108 in Iteration 15) and 51 M/s on cold path (up from 50). See iteration notes below for latest.
 
 Same JDK and JMH config:
 
@@ -269,6 +270,10 @@ Same JDK and JMH config:
 | `2001:0db8:0000:0000:0000:0000:0000:0001` | 39 | 7,482,555 | 5,730,584 | 8,399,369 | **28,293,008** | 11,723,049 |
 | `2001:0db8:85a3:0000:0000:8a2e:0370:7334` | 39 | 7,628,920 | 5,678,687 | 8,390,723 | **28,122,987** | 11,743,336 |
 | `1234:5678:9abc:def0:1234:5678:9abc:def0` | 39 | 7,403,583 | 5,595,413 | 8,357,043 | **28,128,279** | 11,686,738 |
+
+*Iteration 17: Arithmetic hex conversion on hot/mixed paths. Replaces LUT `vpermb` (port 5) with `vpandb`+`vpaddb`+`vpcmpb`+`vpblendmb` (1 port 5 only). Simple approach: `v.and(0x0F)` → nibble, `v.compare(GE,'A')` → letter mask, `nibble + 9` for letters. Hybrid design: arithmetic on hot/mixed paths (no validation needed), LUT kept for cold path (needs -1 sentinel for validate). Hot path 112.0→118.4 M/s (**+5.7%**), cold path unchanged (51.2 M/s).*
+
+*Iteration 16: Precomputed `HOT_COMPRESS_MASK` (39-byte nonDelim) + `PAIR_MASK` (0x55555555 for pairNibbles). Deferred `nonDelim` computation to mixed-span/cold paths. Hot path 108.2→112.0 M/s (**+3.5%**), cold path unchanged (51.8 M/s).*
 
 *Iteration 15: Merge delimiter detection + precomputed masks + nonDelim hot path. Three easy wins implemented simultaneously: (1) single vector load for both `:` and `.` in single-vector path, reuse for hex conversion — saves `findDelimiters` call and `fromArray`; (2) precomputed `MASK_39` and `MASK_16` — avoids `indexInRange` allocation on hot path; (3) hot path uses `nonDelim` mask from delimiter bits directly instead of `r.compare(GE,0).toLong()` — skips compare + `kmovq`. Also fixed pre-existing `ipv4Suffix` octet > 255 bug (return null for `::ffff:192.168.0.256`). Hot path 50→108 M/s (**+116%**), cold path (`::1`) 33→50 M/s (**+52%**).*
 
@@ -347,15 +352,15 @@ Five changes drove the improvement:
 |----|---|---|---|---|---|---|
 | Short (3-11) | **Vector 1.15-1.25x** | Scalar 1x | VectorCE 0.65-0.92x | SWAROpt 0.68-0.73x | SWAR 0.57x |
 | Medium (19-22) | **Vector 1.85-2.85x** | VectorCE 0.97-1.20x | SWAROpt 1.02x | Scalar 1x | SWAR 0.80x |
-| **Long (39)** | **Vector 7.6x** | VectorCE 2.0x | SWAROpt 1.04x | Scalar 1x | SWAR 0.70x |
+| **Long (39)** | **Vector 13.1x** | VectorCE 2.0x | SWAROpt 1.04x | Scalar 1x | SWAR 0.70x |
 
 
-*Rankings updated for Iteration 15. Vector throughput on 39-byte hot path is now 108 M/s — exceeding C AVX-512's 71.3 M/s by 1.52×.*
+*Rankings updated for Iteration 17. Vector throughput on 39-byte hot path is now 118 M/s — exceeding C AVX-512's 71.3 M/s by 1.66×.*
 
 **Key findings**:
-1. **Vector now leads on ALL input lengths** — short input `::1` at 50 M/s (vs scalar 34 M/s, +47%), long 39-byte at 108 M/s (vs scalar 9 M/s, **12×**).
-2. **Vector exceeds C AVX-512 throughput**: 108 M/s vs 71.3 M/s = **1.52×**. This is despite higher instruction count (Vector API overhead) — the higher IPC (4.95 vs C's 2.45) and faster clock (2.6 GHz vs 2.8 GHz Xeon Gold) compensate.
-3. **Scalar is now 3rd place** — Vector 12× scalar on long, 1.5× on short.
-4. **Iteration 15's three easy wins** (merged delimiter detection, precomputed masks, nonDelim hot path) were the direct implementation of the recommendations from PERF_PROFILE.md (Ideas 1+2+3).
+1. **Vector now leads on ALL input lengths** — short input `::1` at 51 M/s (vs scalar 34 M/s, +50%), long 39-byte at 118 M/s (vs scalar 9 M/s, **13×**).
+2. **Vector exceeds C AVX-512 throughput**: 118 M/s vs 71.3 M/s = **1.66×**. This is despite higher instruction count (Vector API overhead) — the higher IPC (4.95 vs C's 2.45) and faster clock (2.6 GHz vs 2.8 GHz Xeon Gold) compensate.
+3. **Scalar is now 3rd place** — Vector 13× scalar on long, 1.5× on short.
+4. **Iterations 15–17** (merged delimiter detection, precomputed masks, arithmetic hex conversion) removed two port-5 ops (vpermb + kmovq) from the hot path, contributing +136% cumulative gain over Iteration 14.
 
-Conclusion: **Vector now exceeds C AVX-512 throughput on Ice Lake**. The remaining gap is pure Vector API overhead (~30% range checks and safety guards absent in C). Java's higher IPC (4.95 vs C's 2.45) from better instruction scheduling on Ice Lake's wide pipeline more than compensates for the extra instructions.
+Conclusion: **Vector now exceeds C AVX-512 throughput on Ice Lake by 1.66×**. The remaining gap is pure Vector API overhead (~30% range checks and safety guards absent in C). Java's higher IPC (4.95 vs C's 2.45) from better instruction scheduling on Ice Lake's wide pipeline more than compensates for the extra instructions.
