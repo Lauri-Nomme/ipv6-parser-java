@@ -22,6 +22,11 @@ public class Ipv6ParserVector {
     // Precomputed masks for common sizes (avoid indexInRange computation)
     static final VectorMask<Byte> MASK_39 = SPECIES.indexInRange(0, 39);
     static final VectorMask<Byte> MASK_16 = SPECIES.indexInRange(0, 16);
+    // Mask for packing paired bytes: select even lanes (0,2,4,...,30)
+    static final VectorMask<Byte> PAIR_MASK = VectorMask.fromLong(SPECIES, 0x55555555L);
+    // Precomputed non-delim for hot path (39-byte all-span-4): colon at 4,9,14,19,24,29,34
+    static final long HOT_NON_DELIM = ~((1L<<4) | (1L<<9) | (1L<<14) | (1L<<19) | (1L<<24) | (1L<<29) | (1L<<34)) & ((1L<<39) - 1);
+    static final VectorMask<Byte> HOT_COMPRESS_MASK = VectorMask.fromLong(SPECIES, HOT_NON_DELIM);
     // reusable buffer for hex nibble output (single-threaded use)
     static final byte[] HEX_BUF = new byte[45];
 
@@ -105,7 +110,6 @@ public class Ipv6ParserVector {
         // ---- Phase 5+6: validate, convert & assemble output ----------
         byte[] out = new byte[16];
         long delims = colonBits | dotBits;
-        long nonDelim = (~delims) & ((1L << len) - 1);
 
         if (len <= SL) {
             // Single-vector fast path: reuse cached vector from Phase 1
@@ -118,12 +122,13 @@ public class Ipv6ParserVector {
                 // Hot path: all hex segments, no ::, no IPv4
                 if (len - nc == hexGroups * 4) {
                     // All segments span exactly 4 chars — vector compress+pair
-                    // Use precomputed nonDelim mask — skips validation (safe on hot path)
-                    ByteVector hexNibs = r.compress(VectorMask.fromLong(SPECIES, nonDelim));
+                    // Use precomputed mask — no fromLong/kmovq, no validation
+                    ByteVector hexNibs = r.compress(HOT_COMPRESS_MASK);
                     pairNibbles(hexNibs).intoArray(out, 0, MASK_16);
                     return out;
                 }
                 // Mixed-span fast path: compress + expand(per-segment pad) + pair
+                long nonDelim = (~delims) & ((1L << len) - 1);
                 ByteVector hexNibs = r.compress(VectorMask.fromLong(SPECIES, nonDelim));
                 long expandBits = computeExpandMask(colonBits, len, nc, segs, pad);
                 if (expandBits == -1L) return null; // invalid span
@@ -133,6 +138,7 @@ public class Ipv6ParserVector {
             }
 
             // Cold path or IPv4: validate hex conversion first
+            long nonDelim = (~delims) & ((1L << len) - 1);
             VectorMask<Byte> keep = r.compare(VectorOperators.GE, (byte) 0);
             if (((~keep.toLong()) & ((1L << len) - 1)) != delims) return null;
 
@@ -249,14 +255,14 @@ public class Ipv6ParserVector {
     /** Pair adjacent nibble bytes into bytes using short-vector arithmetic.
      *  Input: each byte holds a nibble (0-15), adjacent pairs form output bytes.
      *  Uses reinterpret as shorts to combine pairs, then compress to pack.
-     *  Saves 1 port-5 rearrange vs even/odd approach. */
+     *  Uses precomputed PAIR_MASK to save fromLong call. */
     static ByteVector pairNibbles(ByteVector v) {
         ShortVector sv = (ShortVector) v.reinterpretAsShorts();
         ShortVector low = sv.and((short) 0xFF);
         ShortVector high = (ShortVector) sv.lanewise(VectorOperators.LSHR, 8).and((short) 0xFF);
         ShortVector paired = low.mul((short) 16).or(high);
         ByteVector pairedBytes = (ByteVector) paired.reinterpretAsBytes();
-        return pairedBytes.compress(VectorMask.fromLong(SPECIES, 0x55555555L));
+        return pairedBytes.compress(PAIR_MASK);
     }
 
     // -----------------------------------------------------------------
